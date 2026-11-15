@@ -46,6 +46,7 @@ DEFAULT_CORE_WATCHLIST = [
     "TSLA",
     "LUNR",
     "SPCX",
+    "TSM",
     "AAPL",
     "MSFT",
     "AMZN",
@@ -55,7 +56,7 @@ DEFAULT_CORE_WATCHLIST = [
     "COST",
     "NFLX",
 ]
-MARKET_INDEX_TICKERS = ["SPY", "QQQ"]
+MARKET_INDEX_TICKERS = ["SPY", "QQQ", "SMH"]
 NASDAQ_TOP10_TICKERS = [
     "AAPL",
     "NVDA",
@@ -1637,14 +1638,14 @@ def generate_morning_briefing_report(
 
     lines = [
         "🌅 *【美股開盤前 GEX 籌碼戰情早報】*",
-        f"時間：`{now_tw}`（近4期跨到期日主力籌碼聚合）",
+        f"時間：`{now_tw}`（未來14天內全到期日主力籌碼聚合）",
         "",
         "🧭 *【一、 納斯達克 100 與前十大權重股總體方向】*",
         f"• 定調：*{ndx_diag['overall_badge']}*",
         f"• 權重結構：正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）",
         f"• 方向研判：{ndx_diag['direction_summary']}",
         "",
-        "📊 *【二、 大盤雙指標 (SPY & QQQ)】*",
+        "📊 *【二、 大盤與費半三指標 (SPY / QQQ / SMH)】*",
     ]
 
     for idx_tk in MARKET_INDEX_TICKERS:
@@ -1652,7 +1653,7 @@ def generate_morning_briefing_report(
             lines.append(format_clean_3line_stock_brief(scanned_map[idx_tk]))
             lines.append("")
 
-    lines.append("🎯 *【三、 核心自選股 12 檔開盤作戰地圖】*")
+    lines.append("🎯 *【三、 核心自選股 13 檔開盤作戰地圖 (含 TSM)】*")
     for c_tk in core_tickers:
         if c_tk in scanned_map:
             lines.append(format_clean_3line_stock_brief(scanned_map[c_tk]))
@@ -1979,7 +1980,7 @@ def run_streamlit_warroom() -> None:
         app_tab = st.radio(
             "選擇功能模式",
             [
-                "🚦 核心 14 檔燈號總覽 & 單股日K診斷 (首頁預設)",
+                "🚦 核心 16 檔燈號總覽 & 單股日K診斷 (首頁預設)",
                 "🌎 全美股 5,000+ 檔批次掃描雷達",
             ],
             index=0,
@@ -1995,7 +1996,7 @@ def run_streamlit_warroom() -> None:
         st.divider()
         st.subheader("🌅 核心自選股與每日早報")
         core_wl_str = st.text_area(
-            "核心自選股清單 (含 NVDA, TSLA, LUNR, SPCX 與納指前十大)",
+            "核心自選股清單 (含 NVDA, TSLA, LUNR, SPCX, TSM 與納指前十大)",
             value=cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST)),
             height=90,
         )
@@ -2049,7 +2050,7 @@ def run_streamlit_warroom() -> None:
             if not tg_token or not tg_chat_id:
                 st.error("請先填入 Telegram Bot Token 與 Chat ID！")
             else:
-                with st.spinner("正在計算納指方向與 14 檔核心股早報..."):
+                with st.spinner("正在計算納指方向與 16 檔核心股早報..."):
                     c_list = parse_watchlist_string(core_wl_str)
                     brief_txt = generate_morning_briefing_report(c_list, iv_drop_thresh)
                     ok_b, detail_b = send_telegram_alert_with_detail(
@@ -2060,12 +2061,12 @@ def run_streamlit_warroom() -> None:
                 else:
                     st.error(f"發送失敗：{detail_b}")
 
-        if st.button("📈 立即同步 SPY/QQQ 與 12 檔核心股 GEX 至 MT5 (Common\\Files)"):
+        if st.button("📈 立即同步 SPY/QQQ/SMH 與 13 檔核心股 GEX 至 MT5 (Common\\Files)"):
             with st.spinner("正在寫入 MT5 Common\\Files\\gex_mt5_levels.csv..."):
                 c_list = parse_watchlist_string(core_wl_str)
                 _ = generate_morning_briefing_report(c_list, iv_drop_thresh)
                 mt5_csv_p = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
-            st.success(f"✅ 已同步 14 檔核心股至 MT5：`{mt5_csv_p}`")
+            st.success(f"✅ 已同步 16 檔核心股至 MT5：`{mt5_csv_p}`")
 
         if IS_WINDOWS_VPS:
             if st.button("👻 一鍵啟動『無黑窗隱形背景常駐』並加入開機自啟 (按完即可關掉 CMD)"):
@@ -2086,10 +2087,10 @@ def run_streamlit_warroom() -> None:
         with top_c1:
             st.markdown("#### 🧭 一、 納斯達克 100 (QQQ + 前十大權重股) 總體 Gamma 狀況與方向研判")
         with top_c2:
-            if st.button("🔄 刷新 14 檔燈號", use_container_width=True):
+            if st.button("🔄 刷新 16 檔燈號", use_container_width=True):
                 cached_core_14_scan.clear()
 
-        with st.spinner("正在同步核心 14 檔與納斯達克前十大期權 GEX 燈號..."):
+        with st.spinner("正在同步核心 16 檔 (含 SMH 費半與 TSM) 期權 GEX 燈號..."):
             snap_map = cached_core_14_scan(tuple(core_list), iv_drop_thresh)
 
         if snap_map:
@@ -2116,7 +2117,7 @@ def run_streamlit_warroom() -> None:
                     f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
                 )
 
-            st.markdown("#### 🚦 二、 核心 14 檔（SPY/QQQ + 12 檔核心自選股）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
+            st.markdown("#### 🚦 二、 核心 16 檔（SPY/QQQ/SMH 費半 + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
             if "selected_ticker" not in st.session_state:
                 st.session_state["selected_ticker"] = "AAPL"
 
@@ -2161,42 +2162,56 @@ def run_streamlit_warroom() -> None:
                 unsafe_allow_html=True,
             )
 
-            grid_cols = st.columns(3)
-            for idx, tk_sym in enumerate(quick_14_list):
-                col_obj = grid_cols[idx % 3]
+            def _render_lamp_card(col_obj, tk_sym: str) -> None:
                 sn = snap_map.get(tk_sym)
-                if sn is not None:
-                    chg_p = ((sn.spot_price - sn.prev_close) / max(sn.prev_close, 0.01)) * 100.0
-                    lamp = "🟢 正Gamma" if sn.is_positive_gamma else "🔴 負Gamma"
-                    cls_name = "gex-pos" if sn.is_positive_gamma else "gex-neg"
-                    chg_col = "#00E676" if chg_p >= 0 else "#FF5252"
-                    pw_note = (
-                        f"${sn.put_wall:.1f} (⚠️已破/次撐${sn.next_lower_put_wall:.1f})"
-                        if sn.put_wall > sn.spot_price
-                        else f"${sn.put_wall:.1f}"
-                    )
-                    cw_note = (
-                        f"${sn.call_wall:.1f} (🚀已破/次壓${sn.next_upper_call_wall:.1f})"
-                        if sn.call_wall < sn.spot_price
-                        else f"${sn.call_wall:.1f}"
-                    )
-                    card_html = (
-                        f"<div class=\"gex-card {cls_name}\">"
-                        f"<div style=\"font-weight:700;font-size:14.5px;color:#FFFFFF;\">"
-                        f"{lamp} ｜ {sn.ticker} <span style=\"color:{chg_col};\">${sn.spot_price:.2f} ({chg_p:+.1f}%)</span>"
-                        f"</div>"
-                        f"<div style=\"color:#E0E0E0;margin-top:3px;\">"
-                        f"• <b>Put牆</b>: {pw_note} ｜ <b>Call牆</b>: {cw_note}"
-                        f"</div>"
-                        f"<div style=\"color:#B0BEC5;\">"
-                        f"• <b>痛點</b>: ${sn.max_pain:.1f} ｜ <b>翻轉點</b>: ${sn.zero_gamma_flip:.2f} ｜ <b>GEX</b>: {sn.net_gex_millions:+.1f}M"
-                        f"</div>"
-                        f"</div>"
-                    )
-                    with col_obj:
-                        st.markdown(card_html, unsafe_allow_html=True)
-                        if st.button(f"📈 查看 {sn.ticker} 日K與GEX圖", key=f"lamp_{tk_sym}", use_container_width=True):
-                            st.session_state["selected_ticker"] = tk_sym
+                if sn is None:
+                    return
+                chg_p = ((sn.spot_price - sn.prev_close) / max(sn.prev_close, 0.01)) * 100.0
+                lamp = "🟢 正Gamma" if sn.is_positive_gamma else "🔴 負Gamma"
+                cls_name = "gex-pos" if sn.is_positive_gamma else "gex-neg"
+                chg_col = "#00E676" if chg_p >= 0 else "#FF5252"
+                pw_note = (
+                    f"${sn.put_wall:.1f} (⚠️已破/次撐${sn.next_lower_put_wall:.1f})"
+                    if sn.put_wall > sn.spot_price
+                    else f"${sn.put_wall:.1f}"
+                )
+                cw_note = (
+                    f"${sn.call_wall:.1f} (🚀已破/次壓${sn.next_upper_call_wall:.1f})"
+                    if sn.call_wall < sn.spot_price
+                    else f"${sn.call_wall:.1f}"
+                )
+                card_html = (
+                    f"<div class=\"gex-card {cls_name}\">"
+                    f"<div style=\"font-weight:700;font-size:14.5px;color:#FFFFFF;\">"
+                    f"{lamp} ｜ {sn.ticker} <span style=\"color:{chg_col};\">${sn.spot_price:.2f} ({chg_p:+.1f}%)</span>"
+                    f"</div>"
+                    f"<div style=\"color:#E0E0E0;margin-top:3px;\">"
+                    f"• <b>Put牆</b>: {pw_note} ｜ <b>Call牆</b>: {cw_note}"
+                    f"</div>"
+                    f"<div style=\"color:#B0BEC5;\">"
+                    f"• <b>痛點</b>: ${sn.max_pain:.1f} ｜ <b>翻轉點</b>: ${sn.zero_gamma_flip:.2f} ｜ <b>GEX</b>: {sn.net_gex_millions:+.1f}M"
+                    f"</div>"
+                    f"</div>"
+                )
+                with col_obj:
+                    st.markdown(card_html, unsafe_allow_html=True)
+                    if st.button(f"📈 查看 {sn.ticker} 日K與GEX圖", key=f"lamp_{tk_sym}", use_container_width=True):
+                        st.session_state["selected_ticker"] = tk_sym
+
+            # 第 1 列專門放「大盤與費半三指標 (SPY / QQQ / SMH)」，確保手機版 QQQ 永遠緊接在 SPY 正下方
+            idx_tks = [t for t in quick_14_list if t in MARKET_INDEX_TICKERS]
+            if idx_tks:
+                idx_cols = st.columns(len(idx_tks))
+                for c_i, tk_sym in enumerate(idx_tks):
+                    _render_lamp_card(idx_cols[c_i], tk_sym)
+
+            # 第 2 列起依序每 3 檔建立獨立橫列 (Row-by-Row)，確保手機版完全依照清單順序由上往下排列
+            other_tks = [t for t in quick_14_list if t not in MARKET_INDEX_TICKERS]
+            for r_start in range(0, len(other_tks), 3):
+                row_slice = other_tks[r_start : r_start + 3]
+                row_cols = st.columns(3)
+                for c_i, tk_sym in enumerate(row_slice):
+                    _render_lamp_card(row_cols[c_i], tk_sym)
 
         st.divider()
         st.markdown("#### 📈 三、 單股標準日 K 線 (含 MA5/MA10/MA20) 與期權 GEX 支撐壓力牆")
@@ -2214,7 +2229,7 @@ def run_streamlit_warroom() -> None:
             st.session_state["selected_ticker"] = ticker_input
         with col_inp2:
             exp_idx = st.number_input(
-                "期權範圍 (0=近4期聚合含週五OPEX)", min_value=0, max_value=8, value=0
+                "期權範圍 (0=未來14天內全合約聚合含週五OPEX)", min_value=0, max_value=8, value=0
             )
         with col_inp3:
             lock_zoom = st.checkbox(
@@ -2411,7 +2426,7 @@ def run_streamlit_warroom() -> None:
             u_mode = st.selectbox(
                 "選擇掃描股票池範圍",
                 [
-                    "CUSTOM (掃描大盤 SPY/QQQ + 12 檔核心自選股)",
+                    "CUSTOM (掃描 SPY/QQQ/SMH + 13 檔核心自選股)",
                     "SP500_NDX100 (標普 500 + 納斯達克 100 全成分股快篩)",
                     "ALL_US (SEC 全美股 5,000+ 檔 + 第一階段量價異動快篩)",
                     "MOST_ACTIVE (全美股 130 檔高期權流動性核心池)",
@@ -2425,7 +2440,7 @@ def run_streamlit_warroom() -> None:
         if u_mode.startswith("CUSTOM"):
             custom_str = st.text_input(
                 "輸入欲批次掃描之美股代號",
-                value="SPY, QQQ, " + core_wl_str,
+                value="SPY, QQQ, SMH, " + core_wl_str,
             )
 
         if st.button("🚀 立即手動執行一次批次掃描", type="primary"):
