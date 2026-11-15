@@ -2120,20 +2120,83 @@ def run_streamlit_warroom() -> None:
             if "selected_ticker" not in st.session_state:
                 st.session_state["selected_ticker"] = "AAPL"
 
-            # 以每列 2 欄 (手機友善) 或 4 欄展示 14 檔核心燈號卡
-            grid_cols = st.columns(4)
+            # 注入全域 CSS 解除 Streamlit 按鈕單行省略號 (...) 限制，並使用獨立彩色邊框卡片完整呈現所有數值
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stButton"] > button {
+                    white-space: normal !important;
+                    word-wrap: break-word !important;
+                    height: auto !important;
+                    min-height: 2.2rem !important;
+                    padding: 6px 10px !important;
+                }
+                div[data-testid="stButton"] > button p {
+                    white-space: normal !important;
+                    text-overflow: clip !important;
+                    overflow: visible !important;
+                }
+                .gex-card {
+                    border-radius: 10px;
+                    padding: 10px 12px;
+                    margin-bottom: 6px;
+                    background-color: #161B26;
+                    font-size: 13.5px;
+                    line-height: 1.55;
+                }
+                .gex-pos {
+                    border-left: 5px solid #00E676;
+                    border-top: 1px solid #263238;
+                    border-right: 1px solid #263238;
+                    border-bottom: 1px solid #263238;
+                }
+                .gex-neg {
+                    border-left: 5px solid #FF5252;
+                    border-top: 1px solid #263238;
+                    border-right: 1px solid #263238;
+                    border-bottom: 1px solid #263238;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            grid_cols = st.columns(3)
             for idx, tk_sym in enumerate(quick_14_list):
-                col_obj = grid_cols[idx % 4]
+                col_obj = grid_cols[idx % 3]
                 sn = snap_map.get(tk_sym)
                 if sn is not None:
                     chg_p = ((sn.spot_price - sn.prev_close) / max(sn.prev_close, 0.01)) * 100.0
                     lamp = "🟢 正Gamma" if sn.is_positive_gamma else "🔴 負Gamma"
-                    btn_label = (
-                        f"{lamp}｜{sn.ticker} ${sn.spot_price:.2f} ({chg_p:+.1f}%)\n"
-                        f"Put牆 ${sn.put_wall:.0f} ⟷ Call牆 ${sn.call_wall:.0f} (GEX {sn.net_gex_millions:+.0f}M)"
+                    cls_name = "gex-pos" if sn.is_positive_gamma else "gex-neg"
+                    chg_col = "#00E676" if chg_p >= 0 else "#FF5252"
+                    pw_note = (
+                        f"${sn.put_wall:.1f} (⚠️已破/次撐${sn.next_lower_put_wall:.1f})"
+                        if sn.put_wall > sn.spot_price
+                        else f"${sn.put_wall:.1f}"
                     )
-                    if col_obj.button(btn_label, key=f"lamp_{tk_sym}", use_container_width=True):
-                        st.session_state["selected_ticker"] = tk_sym
+                    cw_note = (
+                        f"${sn.call_wall:.1f} (🚀已破/次壓${sn.next_upper_call_wall:.1f})"
+                        if sn.call_wall < sn.spot_price
+                        else f"${sn.call_wall:.1f}"
+                    )
+                    card_html = (
+                        f"<div class=\"gex-card {cls_name}\">"
+                        f"<div style=\"font-weight:700;font-size:14.5px;color:#FFFFFF;\">"
+                        f"{lamp} ｜ {sn.ticker} <span style=\"color:{chg_col};\">${sn.spot_price:.2f} ({chg_p:+.1f}%)</span>"
+                        f"</div>"
+                        f"<div style=\"color:#E0E0E0;margin-top:3px;\">"
+                        f"• <b>Put牆</b>: {pw_note} ｜ <b>Call牆</b>: {cw_note}"
+                        f"</div>"
+                        f"<div style=\"color:#B0BEC5;\">"
+                        f"• <b>痛點</b>: ${sn.max_pain:.1f} ｜ <b>翻轉點</b>: ${sn.zero_gamma_flip:.2f} ｜ <b>GEX</b>: {sn.net_gex_millions:+.1f}M"
+                        f"</div>"
+                        f"</div>"
+                    )
+                    with col_obj:
+                        st.markdown(card_html, unsafe_allow_html=True)
+                        if st.button(f"📈 查看 {sn.ticker} 日K與GEX圖", key=f"lamp_{tk_sym}", use_container_width=True):
+                            st.session_state["selected_ticker"] = tk_sym
 
         st.divider()
         st.markdown("#### 📈 三、 單股標準日 K 線 (含 MA5/MA10/MA20) 與期權 GEX 支撐壓力牆")
