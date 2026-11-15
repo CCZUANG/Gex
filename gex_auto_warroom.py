@@ -56,7 +56,7 @@ DEFAULT_CORE_WATCHLIST = [
     "COST",
     "NFLX",
 ]
-MARKET_INDEX_TICKERS = ["SPY", "QQQ", "SMH"]
+MARKET_INDEX_TICKERS = ["SPY", "QQQ", "SMH", "SOXX"]
 NASDAQ_TOP10_TICKERS = [
     "AAPL",
     "NVDA",
@@ -1199,6 +1199,56 @@ def render_warroom_chart_png(
 # ============================================================================
 # 4. Telegram 推播與清爽三行式早報 / 納斯達克前十大總體方向研判
 # ============================================================================
+def format_streamlit_card_markdown(snap: WarRoomSnapshot) -> str:
+    """
+    專為 Streamlit Markdown 設計的逐行條列戰情卡（使用標準 - 清單與標題，確保每項數據獨立換行、絕不擠在同一行）
+    """
+    chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
+    regime_emoji = "🟢 正 Gamma (高拋低吸 / 區間收斂)" if snap.is_positive_gamma else "🔴 負 Gamma (追高殺低 / 擠壓爆發)"
+    cw_line = (
+        f"- **主力 Call 牆**：`${snap.call_wall:.2f}` 🚀 *(現價已突破轉下方支撐；上方次級 Call 牆 `${snap.next_upper_call_wall:.2f}`)*"
+        if snap.call_wall < snap.spot_price
+        else f"- **主力 Call 壓力牆**：`${snap.call_wall:.2f}`"
+    )
+    pw_line = (
+        f"- **主力 Put 牆**：`${snap.put_wall:.2f}` ⚠️ *(現價已跌破轉上方反壓；下方次級 Put 牆 `${snap.next_lower_put_wall:.2f}`)*"
+        if snap.put_wall > snap.spot_price
+        else f"- **主力 Put 支撐牆**：`${snap.put_wall:.2f}`"
+    )
+    lines = [
+        f"##### 📡 {snap.ticker} 期權 GEX 日 K 戰情卡",
+        f"- **分析時間**：`{snap.timestamp_tw}`",
+        f"- **期權樣本**：`{snap.expiration_date}`",
+        f"- **最新日 K**：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`)｜[Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
+        f"- **期權體制**：{regime_emoji}",
+        f"- **總淨曝險**：`{snap.net_gex_millions:+.2f}M`｜**Zero Gamma 翻轉點**：`${snap.zero_gamma_flip:.2f}`",
+        "",
+        "##### 🏛️ 全場主力支撐壓力牆與破牆狀態",
+        cw_line,
+        f"- **Max Pain 最大痛點**：`${snap.max_pain:.2f}`",
+        pw_line,
+        "",
+        "##### ⚡ Gamma Squeeze 啟動與衰竭雷達",
+        f"- **向上軋空啟動**：`${snap.bull_squeeze_trigger:.2f}` ➔ **衰竭目標**：`${snap.bull_exhaustion_price:.2f}`",
+        f"- **向下破牆助跌**：`${snap.bear_squeeze_trigger:.2f}` ➔ **空頭目標**：`${snap.bear_exhaustion_price:.2f}`",
+        f"- **ATM IV 狀態**：`{snap.atm_iv_pct:.1f}%`（盤中峰值 `{snap.iv_peak_pct:.1f}%` / 相對回落 `{snap.iv_drop_from_peak_pct:.1f}%`）",
+        f"- **Charm 尾盤平倉窗**：`{snap.charm_unwind_time_tw}`",
+    ]
+    if snap.active_alerts:
+        lines.append("")
+        lines.append("##### 🚨 即時觸發警報與交易計畫")
+        for a in snap.active_alerts:
+            lines.extend(
+                [
+                    f"- **{a.title}**",
+                    f"  - 診斷：{a.description}",
+                    f"  - 策略：{a.action_plan}",
+                    f"  - 點位：進場 `${a.entry_price:.2f}`｜停損 `${a.sl_price:.2f}`｜停利 `${a.tp_price:.2f}` (`RRR 1:{a.rrr:.1f}`)",
+                ]
+            )
+    return "\n".join(lines)
+
+
 def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
     chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
     regime_emoji = "🟢 正 Gamma (高拋低吸 / 區間收斂)" if snap.is_positive_gamma else "🔴 負 Gamma (追高殺低 / 擠壓爆發)"
@@ -1645,7 +1695,7 @@ def generate_morning_briefing_report(
         f"• 權重結構：正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）",
         f"• 方向研判：{ndx_diag['direction_summary']}",
         "",
-        "📊 *【二、 大盤與費半三指標 (SPY / QQQ / SMH)】*",
+        "📊 *【二、 大盤與費半四指標 (SPY / QQQ / SMH / SOXX)】*",
     ]
 
     for idx_tk in MARKET_INDEX_TICKERS:
@@ -1980,7 +2030,7 @@ def run_streamlit_warroom() -> None:
         app_tab = st.radio(
             "選擇功能模式",
             [
-                "🚦 核心 16 檔燈號總覽 & 單股日K診斷 (首頁預設)",
+                "🚦 核心 17 檔燈號總覽 & 單股日K診斷 (首頁預設)",
                 "🌎 全美股 5,000+ 檔批次掃描雷達",
             ],
             index=0,
@@ -2050,7 +2100,7 @@ def run_streamlit_warroom() -> None:
             if not tg_token or not tg_chat_id:
                 st.error("請先填入 Telegram Bot Token 與 Chat ID！")
             else:
-                with st.spinner("正在計算納指方向與 16 檔核心股早報..."):
+                with st.spinner("正在計算納指方向與 17 檔核心股早報..."):
                     c_list = parse_watchlist_string(core_wl_str)
                     brief_txt = generate_morning_briefing_report(c_list, iv_drop_thresh)
                     ok_b, detail_b = send_telegram_alert_with_detail(
@@ -2061,12 +2111,12 @@ def run_streamlit_warroom() -> None:
                 else:
                     st.error(f"發送失敗：{detail_b}")
 
-        if st.button("📈 立即同步 SPY/QQQ/SMH 與 13 檔核心股 GEX 至 MT5 (Common\\Files)"):
+        if st.button("📈 立即同步 SPY/QQQ/SMH/SOXX 與 13 檔核心股 GEX 至 MT5 (Common\\Files)"):
             with st.spinner("正在寫入 MT5 Common\\Files\\gex_mt5_levels.csv..."):
                 c_list = parse_watchlist_string(core_wl_str)
                 _ = generate_morning_briefing_report(c_list, iv_drop_thresh)
                 mt5_csv_p = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
-            st.success(f"✅ 已同步 16 檔核心股至 MT5：`{mt5_csv_p}`")
+            st.success(f"✅ 已同步 17 檔核心股至 MT5：`{mt5_csv_p}`")
 
         if IS_WINDOWS_VPS:
             if st.button("👻 一鍵啟動『無黑窗隱形背景常駐』並加入開機自啟 (按完即可關掉 CMD)"):
@@ -2087,10 +2137,10 @@ def run_streamlit_warroom() -> None:
         with top_c1:
             st.markdown("#### 🧭 一、 納斯達克 100 (QQQ + 前十大權重股) 總體 Gamma 狀況與方向研判")
         with top_c2:
-            if st.button("🔄 刷新 16 檔燈號", use_container_width=True):
+            if st.button("🔄 刷新 17 檔燈號", use_container_width=True):
                 cached_core_14_scan.clear()
 
-        with st.spinner("正在同步核心 16 檔 (含 SMH 費半與 TSM) 期權 GEX 燈號..."):
+        with st.spinner("正在同步核心 17 檔 (含 SMH/SOXX 費半與 TSM) 期權 GEX 燈號..."):
             snap_map = cached_core_14_scan(tuple(core_list), iv_drop_thresh)
 
         if snap_map:
@@ -2117,7 +2167,7 @@ def run_streamlit_warroom() -> None:
                     f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
                 )
 
-            st.markdown("#### 🚦 二、 核心 16 檔（SPY/QQQ/SMH 費半 + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
+            st.markdown("#### 🚦 二、 核心 17 檔（SPY/QQQ/SMH/SOXX + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
             if "selected_ticker" not in st.session_state:
                 st.session_state["selected_ticker"] = "AAPL"
 
@@ -2198,7 +2248,7 @@ def run_streamlit_warroom() -> None:
                     if st.button(f"📈 查看 {sn.ticker} 日K與GEX圖", key=f"lamp_{tk_sym}", use_container_width=True):
                         st.session_state["selected_ticker"] = tk_sym
 
-            # 第 1 列專門放「大盤與費半三指標 (SPY / QQQ / SMH)」，確保手機版 QQQ 永遠緊接在 SPY 正下方
+            # 第 1 列專門放「大盤與費半四指標 (SPY / QQQ / SMH / SOXX)」，確保手機版 QQQ 永遠緊接在 SPY 正下方
             idx_tks = [t for t in quick_14_list if t in MARKET_INDEX_TICKERS]
             if idx_tks:
                 idx_cols = st.columns(len(idx_tks))
@@ -2417,7 +2467,7 @@ def run_streamlit_warroom() -> None:
         )
 
         st.markdown("#### 🧭 四、 單股期權籌碼診斷戰情卡")
-        st.markdown(format_telegram_card_message(snap))
+        st.markdown(format_streamlit_card_markdown(snap))
 
     else:
         st.subheader("🌎 全美股兩階段漏斗高速掃描雷達")
@@ -2426,7 +2476,7 @@ def run_streamlit_warroom() -> None:
             u_mode = st.selectbox(
                 "選擇掃描股票池範圍",
                 [
-                    "CUSTOM (掃描 SPY/QQQ/SMH + 13 檔核心自選股)",
+                    "CUSTOM (掃描 SPY/QQQ/SMH/SOXX + 13 檔核心自選股)",
                     "SP500_NDX100 (標普 500 + 納斯達克 100 全成分股快篩)",
                     "ALL_US (SEC 全美股 5,000+ 檔 + 第一階段量價異動快篩)",
                     "MOST_ACTIVE (全美股 130 檔高期權流動性核心池)",
@@ -2440,7 +2490,7 @@ def run_streamlit_warroom() -> None:
         if u_mode.startswith("CUSTOM"):
             custom_str = st.text_input(
                 "輸入欲批次掃描之美股代號",
-                value="SPY, QQQ, SMH, " + core_wl_str,
+                value="SPY, QQQ, SMH, SOXX, " + core_wl_str,
             )
 
         if st.button("🚀 立即手動執行一次批次掃描", type="primary"):
@@ -2466,7 +2516,7 @@ def run_streamlit_warroom() -> None:
                     f"Put牆 ${snap.put_wall:.1f} ⟷ 痛點 ${snap.max_pain:.1f} ⟷ Call牆 ${snap.call_wall:.1f}",
                     expanded=bool(snap.active_alerts),
                 ):
-                    st.markdown(format_telegram_card_message(snap))
+                    st.markdown(format_streamlit_card_markdown(snap))
                     if snap.active_alerts and tg_token and tg_chat_id:
                         out_png = os.path.join(BASE_DIR, f"{snap.ticker}_warroom_alert.png")
                         render_warroom_chart_png(snap, df_ohlcv, df_gex, out_png)
