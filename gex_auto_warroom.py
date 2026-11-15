@@ -56,7 +56,7 @@ DEFAULT_CORE_WATCHLIST = [
     "COST",
     "NFLX",
 ]
-MARKET_INDEX_TICKERS = ["SPY", "QQQ", "SMH", "SOXX"]
+MARKET_INDEX_TICKERS = ["SPY", "QQQ", "SMH", "SOXX", "GLD"]
 NASDAQ_TOP10_TICKERS = [
     "AAPL",
     "NVDA",
@@ -580,9 +580,25 @@ def bs_greeks(
 
 
 def dealer_call_polarity(
-    call_vol: np.ndarray, call_oi: np.ndarray, call_iv: np.ndarray
+    call_vol: np.ndarray,
+    call_oi: np.ndarray,
+    call_iv: np.ndarray,
+    put_iv: Optional[np.ndarray] = None,
+    ticker: str = "",
 ) -> np.ndarray:
+    """
+    依資產類別區分造市商 Call 部位極性：
+    • 一般股票/科技股：機構常賣 Covered Call (+1.0)，僅當 Vol/OI >= 0.85 且 IV >= 65% 才判定為散戶/動能追買 Call (-1.0)。
+    • 黃金/商品 ETF (GLD, SLV)：黃金波動率基準較低 (~15%~28%) 且機構常買價外 Call 避險/追漲 (Call Skew)，
+      只要 Vol/OI >= 0.80 且呈現 Call Skew (call_iv >= put_iv) 或 IV >= 25%，即判定造市商為 Short Call Gamma (-1.0)。
+    """
     vol_oi = call_vol / np.maximum(call_oi, 1.0)
+    tk_u = ticker.upper()
+    if tk_u in {"GLD", "SLV", "GDX", "USO"}:
+        if put_iv is not None:
+            has_call_skew = call_iv >= put_iv * 0.99
+            return np.where((vol_oi >= 0.80) & (has_call_skew | (call_iv >= 0.25)), -1.0, 1.0)
+        return np.where((vol_oi >= 0.80) & (call_iv >= 0.25), -1.0, 1.0)
     return np.where((vol_oi >= 0.85) & (call_iv >= 0.65), -1.0, 1.0)
 
 
@@ -710,7 +726,7 @@ def evaluate_snapshot_and_alerts(
     _, _, c_gamma, _, _ = bs_greeks(spot, strikes, tte_years, call_iv)
     _, _, p_gamma, _, _ = bs_greeks(spot, strikes, tte_years, put_iv)
 
-    call_pol = dealer_call_polarity(call_vol, call_oi, call_iv)
+    call_pol = dealer_call_polarity(call_vol, call_oi, call_iv, put_iv, ticker)
     if "pre_call_gex_m" in df.columns and "pre_put_gex_m" in df.columns:
         df["call_gex_raw_m"] = df["pre_call_gex_m"].values.astype(float)
         df["put_gex_m"] = df["pre_put_gex_m"].values.astype(float)
@@ -731,13 +747,20 @@ def evaluate_snapshot_and_alerts(
     atm_idx = int(np.argmin(np.abs(strikes - spot)))
     atm_iv_pct = float(((call_iv[atm_idx] + put_iv[atm_idx]) / 2.0) * 100.0)
 
+    today_tw_str = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    ).strftime("%Y-%m-%d")
     tracker = load_tracker_state()
     tk_state = tracker.get(ticker.upper(), {})
-    recorded_iv_peak = float(tk_state.get("iv_peak_pct", atm_iv_pct))
+    if tk_state.get("iv_peak_date") == today_tw_str:
+        recorded_iv_peak = float(tk_state.get("iv_peak_pct", atm_iv_pct))
+    else:
+        recorded_iv_peak = atm_iv_pct
     if simulated_iv_peak_pct is not None:
         iv_peak_pct = max(simulated_iv_peak_pct, atm_iv_pct)
     else:
         iv_peak_pct = max(recorded_iv_peak, atm_iv_pct)
+    tk_state["iv_peak_date"] = today_tw_str
 
     iv_drop_rel_pct = (
         ((iv_peak_pct - atm_iv_pct) / iv_peak_pct) * 100.0 if iv_peak_pct > 0 else 0.0
@@ -1233,7 +1256,14 @@ def format_streamlit_card_markdown(snap: WarRoomSnapshot) -> str:
         f"- **向下破牆助跌**：`${snap.bear_squeeze_trigger:.2f}` ➔ **空頭目標**：`${snap.bear_exhaustion_price:.2f}`",
         f"- **ATM IV 狀態**：`{snap.atm_iv_pct:.1f}%`（盤中峰值 `{snap.iv_peak_pct:.1f}%` / 相對回落 `{snap.iv_drop_from_peak_pct:.1f}%`）",
         f"- **Charm 尾盤平倉窗**：`{snap.charm_unwind_time_tw}`",
+        f"- **🧭 當下操作判定與關鍵路線**：{build_stock_action_advice(snap)}",
     ]
+    cfd_extra = format_cfd_mapping_line(snap, html_mode=False)
+    if cfd_extra:
+        lines.append("")
+        lines.append("##### 🎯 CFD 專屬點位對照 (XAUUSD / US100 / US500)")
+        for cl in cfd_extra.split("\n"):
+            lines.append("- " + cl.strip().lstrip("•").strip())
     if snap.active_alerts:
         lines.append("")
         lines.append("##### 🚨 即時觸發警報與交易計畫")
@@ -1293,13 +1323,187 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
     return "\n".join(lines)
 
 
+CFD_RATIO_CACHE: Dict[str, Tuple[float, float]] = {}
+
+
+def get_cfd_multiplier(etf_ticker: str, etf_spot: float) -> Tuple[str, float]:
+    """
+    將 QQQ 自動換算為 US100 (^NDX) 點位、GLD 自動換算為 XAUUSD (GC=F) 黃金點位、SPY 換算為 US500 (^GSPC) 點位。
+    """
+    tk_u = etf_ticker.upper()
+    if tk_u not in {"QQQ", "GLD", "SPY"} or etf_spot <= 0:
+        return "", 1.0
+
+    now_ts = time.time()
+    if tk_u in CFD_RATIO_CACHE and (now_ts - CFD_RATIO_CACHE[tk_u][0] < 900):
+        mult = CFD_RATIO_CACHE[tk_u][1]
+    else:
+        ref_map = {"QQQ": ("^NDX", 41.1004), "GLD": ("GC=F", 10.855), "SPY": ("^GSPC", 10.0238)}
+        yf_sym, default_mult = ref_map[tk_u]
+        mult = default_mult
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(yf_sym).history(period="5d", interval="1d")
+            if not hist.empty:
+                idx_close = float(hist["Close"].iloc[-1])
+                if idx_close > 0:
+                    mult = idx_close / etf_spot
+        except Exception:
+            pass
+        CFD_RATIO_CACHE[tk_u] = (now_ts, mult)
+
+    cfd_name = {"QQQ": "US100 (NDX)", "GLD": "XAUUSD (黃金)", "SPY": "US500 (SPX)"}[tk_u]
+    return cfd_name, mult
+
+
+def classify_tactical_verdict(s: WarRoomSnapshot, mult: float = 1.0) -> Tuple[str, str, Dict[str, float]]:
+    """
+    明確判別當前屬於【🟢 做多】、【🔴 做空】、【🟡 盤整區間操作】或【⚪ 空手觀察】，
+    並回傳換算後的關鍵作戰點位：盤整上下緣、多頭起漲點➔多單衰竭平倉點、跌破加空點➔空單回補平倉點。
+    """
+    spot = s.spot_price * mult
+    flip = s.zero_gamma_flip * mult
+    pw = s.put_wall * mult
+    cw = s.call_wall * mult
+    mp = s.max_pain * mult
+
+    # 盤整區間上下緣：取現價下方有效支撐與現價上方有效壓力
+    range_low = (s.next_lower_put_wall if s.put_wall > s.spot_price else s.put_wall) * mult
+    range_high = (s.next_upper_call_wall if s.call_wall < s.spot_price else s.call_wall) * mult
+
+    # 多頭起漲點與多單衰竭平倉點
+    bull_start = s.bull_squeeze_trigger * mult
+    bull_tp_exhaust = max(s.bull_exhaustion_price * mult, bull_start * 1.015)
+
+    # 空頭跌破加空點與空單建議平倉點 (空頭衰竭目標 / 下方次級大牆)
+    bear_start = min(s.bear_squeeze_trigger, s.put_wall) * mult
+    bear_tp_exhaust = min(s.bear_exhaustion_price * mult, range_low * 0.985, bear_start * 0.98)
+
+    iv_crushing = s.iv_drop_from_peak_pct >= 6.0
+    near_bull_exhaust = spot >= bull_tp_exhaust * 0.995
+    near_bear_exhaust = spot <= bear_tp_exhaust * 1.005
+
+    levels = {
+        "spot": spot,
+        "flip": flip,
+        "pw": pw,
+        "cw": cw,
+        "mp": mp,
+        "range_low": range_low,
+        "range_high": range_high,
+        "bull_start": bull_start,
+        "bull_tp": bull_tp_exhaust,
+        "bear_start": bear_start,
+        "bear_tp": bear_tp_exhaust,
+    }
+
+    if iv_crushing or near_bull_exhaust or near_bear_exhaust:
+        verdict = "⚪ 【空手觀察 / 獲利了結】（已進入動能衰竭或 IV 回落反轉區）"
+        reason = (
+            f"現價 (${spot:.1f}) 已逼近衰竭目標或觸發 IV 回落 ({s.iv_drop_from_peak_pct:.1f}%)，"
+            f"追價肉少風險大，原順勢部位建議立即平倉落袋，空手等待下一波回測支撐或重新突破。"
+        )
+        return verdict, reason, levels
+
+    if not s.is_positive_gamma:
+        if spot <= bear_start or s.put_wall > s.spot_price:
+            verdict = "🔴 【順勢做空】（跌破支撐牆觸發負 Gamma 助跌）"
+            reason = (
+                f"現價 (${spot:.1f}) 已跌破關鍵防線 (${bear_start:.1f}) 且處於翻轉點 (${flip:.1f}) 下方之負 Gamma 助跌區，"
+                f"造市商被迫順勢拋售避險；反彈不破 ${bear_start:.1f} 偏空操作，空單跌至 ${bear_tp_exhaust:.1f} 建議分批平倉回補。"
+            )
+        elif spot >= bull_start:
+            verdict = "🟢 【順勢做多】（帶量突破負 Gamma 軋空起漲點）"
+            reason = (
+                f"現價 (${spot:.1f}) 已攻克軋空起漲點 (${bull_start:.1f})，造市商負 Gamma 被迫追買助漲；"
+                f"順勢做多並以 ${flip:.1f} 為防守停損，漲至衰竭點 ${bull_tp_exhaust:.1f} 建議獲利平倉。"
+            )
+        else:
+            verdict = "⚪ 【空手觀察】（負 Gamma 中間夾縫區，等待突破起漲點或跌破加空點）"
+            reason = (
+                f"目前位於翻轉點 (${flip:.1f}) 下方之負 Gamma 震盪夾縫，既未漲過起漲點 (${bull_start:.1f}) 也未跌破加空點 (${bear_start:.1f})，"
+                f"中間進場易遭雙巴；建議空手等待漲破 ${bull_start:.1f} 做多、或跌破 ${bear_start:.1f} 做空。"
+            )
+    else:
+        if s.call_wall < s.spot_price or (s.ticker.upper() == "GLD" and spot >= bull_start):
+            verdict = "🟢 【順勢做多】（強勢穿牆 / 黃金 Call Skew 起漲推進）"
+            reason = (
+                f"現價 (${spot:.1f}) 已強勢突破原壓力 (${cw:.1f}) 轉為下方支撐；"
+                f"回測守穩 ${cw:.1f} 偏多操作，上檔漲至衰竭目標 ${bull_tp_exhaust:.1f} 建議分批平倉。"
+            )
+        elif abs(spot - range_low) / max(spot, 1.0) <= 0.012:
+            verdict = "🟢 【逢低做多】（正 Gamma 回測 Put 支撐牆低接區）"
+            reason = (
+                f"正 Gamma 體制下回測下方支撐牆 (${range_low:.1f}) 且守穩翻轉點 (${flip:.1f})，"
+                f"造市商逢低護盤買盤進場；可偏多低接（跌破 ${bear_start:.1f} 停損），漲至 ${range_high:.1f} 平倉。"
+            )
+        else:
+            verdict = "🟡 【盤整區間操作】（正 Gamma 造市商高拋低吸減震區）"
+            reason = (
+                f"處於翻轉點 (${flip:.1f}) 上方之正 Gamma 穩定區，造市商逢低買、逢高賣；"
+                f"於區間下緣 ${range_low:.1f} 低接做多、上緣 ${range_high:.1f} 逢高平倉（痛點中心 ${mp:.1f}）；"
+                f"唯有帶量漲破 ${bull_start:.1f} 才轉為追多看 ${bull_tp_exhaust:.1f}。"
+            )
+
+    return verdict, reason, levels
+
+
+def format_cfd_mapping_line(s: WarRoomSnapshot, html_mode: bool = False) -> str:
+    cfd_name, mult = get_cfd_multiplier(s.ticker, s.spot_price)
+    if not cfd_name:
+        return ""
+    verdict, _, lv = classify_tactical_verdict(s, mult)
+    if html_mode:
+        return (
+            f"<div style=\"background-color:#1E2638;border-radius:6px;padding:7px 9px;margin-top:4px;font-size:13px;border-left:3px solid #FFD54F;\">"
+            f"<div style=\"color:#FFD54F;font-weight:700;\">🎯 【{cfd_name} CFD 實戰點位與判定】 {verdict}</div>"
+            f"<div style=\"color:#FFFFFF;margin-top:2px;\">"
+            f"• <b>CFD 現價</b>: {lv['spot']:.0f} ｜ <b>多空翻轉點</b>: {lv['flip']:.0f} ｜ <b>盤整區間</b>: {lv['range_low']:.0f} ⟷ {lv['range_high']:.0f}"
+            f"</div>"
+            f"<div style=\"color:#80CBC4;margin-top:2px;\">"
+            f"• <b>🚀 多頭路線</b>: 漲過 <b>{lv['bull_start']:.0f} (起漲點)</b> 做多 ➔ 漲到 <b>{lv['bull_tp']:.0f} (衰竭點)</b> 平倉"
+            f"</div>"
+            f"<div style=\"color:#FFAB91;margin-top:2px;\">"
+            f"• <b>🩸 空頭路線</b>: 跌破 <b>{lv['bear_start']:.0f} (加空點)</b> 做空 ➔ 跌到 <b>{lv['bear_tp']:.0f} (空單平倉點)</b> 回補"
+            f"</div>"
+            f"</div>"
+        )
+    return (
+        f"  • 🎯 *【{cfd_name} CFD 判定】*：{verdict}\n"
+        f"  • 📏 *CFD 盤整區間*：`{lv['range_low']:.0f}` (支撐) ⟷ `{lv['range_high']:.0f}` (壓力)｜翻轉點 `{lv['flip']:.0f}`\n"
+        f"  • 🚀 *CFD 多頭路線*：漲過 `{lv['bull_start']:.0f}` (起漲點) 做多 ➔ 到 `{lv['bull_tp']:.0f}` (衰竭點) 平倉\n"
+        f"  • 🩸 *CFD 空頭路線*：跌破 `{lv['bear_start']:.0f}` (加空點) 做空 ➔ 到 `{lv['bear_tp']:.0f}` (空單平倉點) 回補"
+    )
+
+
+def build_stock_action_advice(s: WarRoomSnapshot) -> str:
+    """
+    對所有 18 檔核心股輸出統一結構的「四選一判定 (做多/做空/盤整區間/空手觀察) + 起漲/衰竭/加空/平倉點位」。
+    """
+    cfd_name, mult = get_cfd_multiplier(s.ticker, s.spot_price)
+    verdict, reason, lv = classify_tactical_verdict(s, mult)
+    unit_prefix = f"[{cfd_name}] " if cfd_name else ""
+    fmt = ".0f" if mult > 5.0 else ".1f"
+    return (
+        f"{unit_prefix}{verdict} — {reason} "
+        f"（📌 盤整區間：${lv['range_low']:{fmt}}~${lv['range_high']:{fmt}} ｜ "
+        f"🚀 漲破 ${lv['bull_start']:{fmt}} 起漲 ➔ ${lv['bull_tp']:{fmt}} 衰竭平倉 ｜ "
+        f"🩸 跌破 ${lv['bear_start']:{fmt}} 加空 ➔ ${lv['bear_tp']:{fmt}} 空單平倉）"
+    )
+
+
 def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> Dict:
     """
-    根據 QQQ 與納斯達克前十大權重股 (AAPL, NVDA, MSFT, AMZN, AVGO, META, TSLA, GOOGL, COST, NFLX)
-    之正負 Gamma 家數、淨 GEX 總和與價格相對翻轉點位置，給出整體納斯達克市場狀況與方向研判。
+    結合 SPY/QQQ/SMH/SOXX/GLD 四大指數 ETF 與納斯達克前十大權重股 (及 TSM)，
+    深入解析「法人期權佈局邏輯」、「造市商動態對沖機制」與「整體實戰分析結論」。
     """
     ndx_snaps = [scanned_map[tk] for tk in NASDAQ_TOP10_TICKERS if tk in scanned_map]
     qqq_snap = scanned_map.get("QQQ")
+    spy_snap = scanned_map.get("SPY")
+    smh_snap = scanned_map.get("SMH")
+    soxx_snap = scanned_map.get("SOXX")
+    tsm_snap = scanned_map.get("TSM")
 
     pos_list = [s.ticker for s in ndx_snaps if s.is_positive_gamma]
     neg_list = [s.ticker for s in ndx_snaps if not s.is_positive_gamma]
@@ -1310,29 +1514,70 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
 
     qqq_pos = qqq_snap.is_positive_gamma if qqq_snap else (pos_count >= 5)
     qqq_gex = qqq_snap.net_gex_millions if qqq_snap else total_ndx_gex
+    spy_gex = spy_snap.net_gex_millions if spy_snap else 0.0
+    smh_gex = smh_snap.net_gex_millions if smh_snap else 0.0
+    soxx_gex = soxx_snap.net_gex_millions if soxx_snap else 0.0
+
+    qqq_flip_str = f"${qqq_snap.zero_gamma_flip:.2f} (約合 NDX/US100 {qqq_snap.zero_gamma_flip * 41.10:.0f} 點)" if qqq_snap else "N/A"
+    qqq_put_str = (
+        f"${qqq_snap.put_wall:.1f} (已跌破，次級支撐 ${qqq_snap.next_lower_put_wall:.1f} / 破牆助跌目標 ${qqq_snap.bear_exhaustion_price:.1f})"
+        if (qqq_snap and qqq_snap.put_wall > qqq_snap.spot_price)
+        else (f"${qqq_snap.put_wall:.1f}" if qqq_snap else "N/A")
+    )
+    smh_status_str = (
+        f"SMH (${smh_snap.spot_price:.2f} / {'正Gamma' if smh_snap.is_positive_gamma else '負Gamma'} {smh_gex:+.1f}M / 翻轉點 ${smh_snap.zero_gamma_flip:.2f})"
+        if smh_snap
+        else "SMH 載入中"
+    )
+    tsm_status_str = (
+        f"、TSM (${tsm_snap.spot_price:.2f} / {'🟢正Gamma' if tsm_snap.is_positive_gamma else '🔴負Gamma'} {tsm_snap.net_gex_millions:+.1f}M)"
+        if tsm_snap
+        else ""
+    )
 
     if qqq_pos and pos_count >= 6:
-        overall_badge = "🟢 納指整體偏多穩健（正 Gamma 護盤主導）"
-        direction_summary = (
-            f"前十大權重股有 {pos_count}/10 檔處於正 Gamma（合計 Net GEX {total_ndx_gex:+.1f}M），"
-            f"且 QQQ 大盤站穩翻轉點之上。造市商處於「逢低買進護盤、逢高調節」的減震體制，"
-            f"急跌至 Put 支撐牆易有強勁買盤承接，整體方向偏多震盪墊高，適合拉回支撐牆做多或賣方收租。"
+        overall_badge = "🟢 納指與權重股全面正 Gamma 共振（造市商逢低護盤、偏多震盪墊高）"
+        inst_behavior = (
+            f"法人在 QQQ ({qqq_gex:+.1f}M) 與前十大權重股（{pos_count}/10 檔正 Gamma，合計 {total_ndx_gex:+.1f}M）"
+            f"皆以賣出 Call 收租或偏多部位為主，未出現恐慌性指數買 Put 避險；費半 {smh_status_str}{tsm_status_str}。"
         )
-    elif (not qqq_pos) and neg_count >= 6:
-        overall_badge = "🔴 納指高波動單邊警戒（負 Gamma 助漲助跌主導）"
-        direction_summary = (
-            f"前十大權重股有 {neg_count}/10 檔落入負 Gamma（合計 Net GEX {total_ndx_gex:+.1f}M），"
-            f"且 QQQ 處於負 Gamma 區！造市商被迫「追高買進、殺低拋售」順勢放大波動，"
-            f"嚴禁在跌破 Put 牆時逆勢接刀；若帶量突破軋空啟動價則順勢追多，留意雙向劇烈洗盤。"
+        mm_mechanism = (
+            "造市商在指數與個股雙端皆處於「Long Gamma（跌買漲賣）」減震模式：盤中任何回檔接近 Put 支撐牆都會觸發造市商自動買進現貨與期貨護盤，波動率收斂、下檔支撐極強。"
+        )
+        conclusion_plan = (
+            f"1. 【大盤與費半方向】：只要 QQQ 守穩翻轉點 {qqq_flip_str} 之上，維持拉回偏多思維，不追高、逢回測 Put 牆 ({qqq_put_str}) 分批低接。\n"
+            f"2. 【個股首選】：優先操作正 Gamma 強勢護盤股（{', '.join(pos_list)}），於回測各自 Put 支撐牆時進場，接近 Call 牆分批獲利。"
+        )
+    elif (not qqq_pos) and pos_count >= 5:
+        overall_badge = "🟡 指數負 Gamma 避險 vs. 權重股正 Gamma 護盤（機構買大盤保險、個股抗跌之高波動拉扯盤）"
+        inst_behavior = (
+            f"華爾街法人並未大舉拋售科技巨頭現貨（前十大權重股有 {pos_count} 檔維持正 Gamma：{', '.join(pos_list)}，合計 {total_ndx_gex:+.1f}M），"
+            f"但法人為了對沖總體事件風險，集中在指數 ETF 大舉買進保護性 Put，導致 SPY ({spy_gex:+.1f}M)、QQQ ({qqq_gex:+.1f}M) 與費半 {smh_status_str} 呈現深負 Gamma；"
+            f"僅半導體與部分高 Beta 股（{', '.join(neg_list)}{tsm_status_str}）落入負 Gamma。"
+        )
+        mm_mechanism = (
+            f"造市商面臨「指數端 Short Gamma 助跌 vs. 個股端 Long Gamma 護盤」的雙向拉扯：當大盤微幅轉弱時，造市商在 QQQ/SPY 與半導體 ({', '.join(neg_list)}) 被迫順勢拋售期貨助跌，容易引發盤中急殺；"
+            f"但當急殺把 {pos_count} 檔正 Gamma 權重股拖向各自的 Put 支撐牆時，個股端造市商又會逆勢逢低大買現貨護盤，形成「指數急殺容易V轉彈回、上下影線極長」的雙巴震盪格局。"
+        )
+        conclusion_plan = (
+            f"1. 【大盤與 US100 指數結論】：QQQ 目前位於翻轉點 {qqq_flip_str} 下方，Put 牆狀態為 {qqq_put_str}；在站回翻轉點前指數波動劇烈，嚴禁在跌破次級支撐時逆勢摸底接刀，須等站回翻轉點或突破軋空啟動價再順勢做多。\n"
+            f"2. 【半導體與負 Gamma 警戒組（{', '.join(neg_list)}）】：目前受費半與大盤負 Gamma 拖累，未站回翻轉點前避免左側接刀，提防跌破 Put 牆後往空頭衰竭目標加速。\n"
+            f"3. 【正 Gamma 護盤低接組（{', '.join(pos_list)}）】：具有造市商低接買盤保護，急殺回測各自 Put 支撐牆且未跌破時為最佳右側低接標的，反彈至 Call 牆即獲利了結。"
         )
     else:
-        overall_badge = "🟡 納指權重股多空分歧（結構性輪動震盪盤）"
-        direction_summary = (
-            f"前十大權重股正 Gamma 有 {pos_count} 檔（{', '.join(pos_list) or '無'}）、"
-            f"負 Gamma 有 {neg_count} 檔（{', '.join(neg_list) or '無'}），合計 Net GEX {total_ndx_gex:+.1f}M。"
-            f"指數空間受限於權重股正負力道抵銷，操作上應避開負 Gamma 破底弱勢股，集中資金操作正 Gamma 護盤股。"
+        overall_badge = "🔴 納指與權重股全面負 Gamma 助跌警戒（造市商追高殺低、提防破牆連鎖宣洩）"
+        inst_behavior = (
+            f"法人在大盤 QQQ ({qqq_gex:+.1f}M)、SPY ({spy_gex:+.1f}M)、費半 {smh_status_str} 以及過半數權重股（{neg_count}/10 檔負 Gamma：{', '.join(neg_list)}，合計 {total_ndx_gex:+.1f}M）同步大買 Put 避險。"
+        )
+        mm_mechanism = (
+            "造市商在指數與權重股雙端皆處於「Short Gamma（跌賣漲買）」順勢放大波動模式：一旦跌破 Put 牆，造市商毫無低接護盤買盤，反而必須沿路追空期貨與現貨，極易走出單邊長黑或急跌後暴力嘎空的極端行情。"
+        )
+        conclusion_plan = (
+            f"1. 【大盤與 US100 指數結論】：QQQ 需重新收復翻轉點 {qqq_flip_str} 才能解除助跌警報；若跌破 {qqq_put_str} 務必嚴格停損或順勢偏空。\n"
+            f"2. 【個股操作結論】：全面避開跌破 Put 牆之負 Gamma 股（{', '.join(neg_list)}），僅保留極少數正 Gamma 股（{', '.join(pos_list) or '無'}）或等帶量突破軋空啟動價再右側追擊。"
         )
 
+    direction_summary = f"{inst_behavior} {mm_mechanism}"
     return {
         "pos_count": pos_count,
         "neg_count": neg_count,
@@ -1341,29 +1586,36 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
         "total_ndx_gex": round(total_ndx_gex, 1),
         "above_flip_count": above_flip_count,
         "qqq_gex": round(qqq_gex, 1),
+        "spy_gex": round(spy_gex, 1),
+        "smh_gex": round(smh_gex, 1),
+        "soxx_gex": round(soxx_gex, 1),
         "overall_badge": overall_badge,
+        "inst_behavior": inst_behavior,
+        "mm_mechanism": mm_mechanism,
+        "conclusion_plan": conclusion_plan,
         "direction_summary": direction_summary,
     }
 
 
 def format_clean_3line_stock_brief(s: WarRoomSnapshot) -> str:
     """
-    清爽易讀的三行式早報卡片（每檔股票之間留空行，手機一眼看懂）
+    清爽易讀的四行式早報卡片（含支撐壓力牆、啟動/衰竭價位與近期操作建議）
     """
     chg_pct = ((s.spot_price - s.prev_close) / max(s.prev_close, 0.01)) * 100.0
     light = "🟢 正Gamma" if s.is_positive_gamma else "🔴 負Gamma"
-    line1 = f"*{s.ticker}* (`${s.spot_price:.2f}` / `{chg_pct:+.2f}%`)｜{light} (`{s.net_gex_millions:+.1f}M`)"
-    pw_tag = f"${s.put_wall:.1f}(⚠️已跌破轉壓/次撐${s.next_lower_put_wall:.1f})" if s.put_wall > s.spot_price else f"${s.put_wall:.1f}"
-    cw_tag = f"${s.call_wall:.1f}(🚀已突破轉撐/次壓${s.next_upper_call_wall:.1f})" if s.call_wall < s.spot_price else f"${s.call_wall:.1f}"
-    line2 = f"  • 籌碼牆：Put牆 `{pw_tag}` ｜ 痛點 `${s.max_pain:.1f}` ｜ Call牆 `{cw_tag}`" 
-    if s.is_positive_gamma:
-        line3 = f"  • 轉折：翻轉點 `${s.zero_gamma_flip:.2f}`｜預期波動 `±${s.expected_move_usd:.1f}` (`±{s.expected_move_pct:.1f}%`)"
-    else:
-        line3 = (
-            f"  • 擠壓：突破 `${s.bull_squeeze_trigger:.1f}` 軋空 (目標 `${s.bull_exhaustion_price:.1f}`)｜"
-            f"跌破 `${s.bear_squeeze_trigger:.1f}` 助跌"
-        )
-    return f"{line1}\n{line2}\n{line3}"
+    line1 = f"*{s.ticker}* (`${s.spot_price:.2f}` / `{chg_pct:+.2f}%`)｜{light} (`{s.net_gex_millions:+.1f}M`)｜翻轉點 `${s.zero_gamma_flip:.2f}`"
+    pw_tag = f"${s.put_wall:.1f}(⚠️已破/次撐${s.next_lower_put_wall:.1f})" if s.put_wall > s.spot_price else f"${s.put_wall:.1f}"
+    cw_tag = f"${s.call_wall:.1f}(🚀已破/次壓${s.next_upper_call_wall:.1f})" if s.call_wall < s.spot_price else f"${s.call_wall:.1f}"
+    line2 = f"  • 支撐壓力：Put牆 `{pw_tag}` ｜ 痛點 `${s.max_pain:.1f}` ｜ Call牆 `{cw_tag}`"
+    line3 = (
+        f"  • 啟動與衰竭：🚀 軋空啟動 `${s.bull_squeeze_trigger:.1f}` ➔ 衰竭 `${s.bull_exhaustion_price:.1f}` ｜ "
+        f"🩸 破牆啟動 `${s.bear_squeeze_trigger:.1f}` ➔ 空頭衰竭 `${s.bear_exhaustion_price:.1f}`"
+    )
+    cfd_line = format_cfd_mapping_line(s, html_mode=False)
+    line4 = f"  • 💡 建議：{build_stock_action_advice(s)}"
+    if cfd_line:
+        return f"{line1}\n{cfd_line}\n{line2}\n{line3}\n{line4}"
+    return f"{line1}\n{line2}\n{line3}\n{line4}"
 
 
 def send_telegram_alert_with_detail(
@@ -1690,12 +1942,14 @@ def generate_morning_briefing_report(
         "🌅 *【美股開盤前 GEX 籌碼戰情早報】*",
         f"時間：`{now_tw}`（未來14天內全到期日主力籌碼聚合）",
         "",
-        "🧭 *【一、 納斯達克 100 與前十大權重股總體方向】*",
-        f"• 定調：*{ndx_diag['overall_badge']}*",
-        f"• 權重結構：正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）",
-        f"• 方向研判：{ndx_diag['direction_summary']}",
+        "🧭 *【一、 總體 Gamma 結構：法人佈局、造市商對沖與結論】*",
+        f"• *總體定調*：{ndx_diag['overall_badge']}",
+        f"• *權重與指數數據*：前十大正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）｜QQQ `{ndx_diag['qqq_gex']:+.1f}M`｜SPY `{ndx_diag['spy_gex']:+.1f}M`｜SMH `{ndx_diag['smh_gex']:+.1f}M`",
+        f"• *① 法人籌碼操作*：{ndx_diag['inst_behavior']}",
+        f"• *② 造市商對沖機制*：{ndx_diag['mm_mechanism']}",
+        f"• *③ 實戰分析結論*：\n{ndx_diag['conclusion_plan']}",
         "",
-        "📊 *【二、 大盤與費半四指標 (SPY / QQQ / SMH / SOXX)】*",
+        "📊 *【二、 大盤、費半與黃金五指標 (SPY / QQQ / SMH / SOXX / GLD)】*",
     ]
 
     for idx_tk in MARKET_INDEX_TICKERS:
@@ -1811,12 +2065,18 @@ class BackgroundPatrolDaemon:
                         core_list = parse_watchlist_string(
                             cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
                         )
-                        results = scan_us_market_universe(
+                        iv_th = float(cfg.get("iv_drop_thresh", 6.0))
+                        # 必掃核心 18 檔 (確保任何一檔發生 ATM IV 回落 >= 6% 都能即時通知手機，不被大盤快篩濾掉)
+                        core_res_map = scan_core_14_tickers_map(core_list, iv_th)
+                        univ_results = scan_us_market_universe(
                             universe_mode=cfg.get("universe_mode", "SP500_NDX100"),
                             custom_tickers=core_list,
                             max_stage2_tickers=int(cfg.get("max_scan", 30)),
-                            iv_crush_drop_threshold_pct=float(cfg.get("iv_drop_thresh", 6.0)),
+                            iv_crush_drop_threshold_pct=iv_th,
                         )
+                        merged_map = {r[0].ticker: r for r in univ_results}
+                        merged_map.update(core_res_map)
+                        results = list(merged_map.values())
                         self.total_scans += 1
                         self.last_run_tw = (
                             datetime.datetime.now(datetime.timezone.utc)
@@ -2030,7 +2290,7 @@ def run_streamlit_warroom() -> None:
         app_tab = st.radio(
             "選擇功能模式",
             [
-                "🚦 核心 17 檔燈號總覽 & 單股日K診斷 (首頁預設)",
+                "🚦 核心 18 檔燈號總覽 & 單股日K診斷 (首頁預設)",
                 "🌎 全美股 5,000+ 檔批次掃描雷達",
             ],
             index=0,
@@ -2100,7 +2360,7 @@ def run_streamlit_warroom() -> None:
             if not tg_token or not tg_chat_id:
                 st.error("請先填入 Telegram Bot Token 與 Chat ID！")
             else:
-                with st.spinner("正在計算納指方向與 17 檔核心股早報..."):
+                with st.spinner("正在計算納指方向與 18 檔核心股早報..."):
                     c_list = parse_watchlist_string(core_wl_str)
                     brief_txt = generate_morning_briefing_report(c_list, iv_drop_thresh)
                     ok_b, detail_b = send_telegram_alert_with_detail(
@@ -2111,12 +2371,12 @@ def run_streamlit_warroom() -> None:
                 else:
                     st.error(f"發送失敗：{detail_b}")
 
-        if st.button("📈 立即同步 SPY/QQQ/SMH/SOXX 與 13 檔核心股 GEX 至 MT5 (Common\\Files)"):
+        if st.button("📈 立即同步 SPY/QQQ/SMH/SOXX/GLD 與 13 檔核心股 GEX 至 MT5 (Common\\Files)"):
             with st.spinner("正在寫入 MT5 Common\\Files\\gex_mt5_levels.csv..."):
                 c_list = parse_watchlist_string(core_wl_str)
                 _ = generate_morning_briefing_report(c_list, iv_drop_thresh)
                 mt5_csv_p = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
-            st.success(f"✅ 已同步 17 檔核心股至 MT5：`{mt5_csv_p}`")
+            st.success(f"✅ 已同步 18 檔核心股至 MT5：`{mt5_csv_p}`")
 
         if IS_WINDOWS_VPS:
             if st.button("👻 一鍵啟動『無黑窗隱形背景常駐』並加入開機自啟 (按完即可關掉 CMD)"):
@@ -2137,37 +2397,34 @@ def run_streamlit_warroom() -> None:
         with top_c1:
             st.markdown("#### 🧭 一、 納斯達克 100 (QQQ + 前十大權重股) 總體 Gamma 狀況與方向研判")
         with top_c2:
-            if st.button("🔄 刷新 17 檔燈號", use_container_width=True):
+            if st.button("🔄 刷新 18 檔燈號", use_container_width=True):
                 cached_core_14_scan.clear()
 
-        with st.spinner("正在同步核心 17 檔 (含 SMH/SOXX 費半與 TSM) 期權 GEX 燈號..."):
+        with st.spinner("正在同步核心 18 檔 (含 SMH/SOXX 費半與 TSM) 期權 GEX 燈號..."):
             snap_map = cached_core_14_scan(tuple(core_list), iv_drop_thresh)
 
         if snap_map:
             ndx_info = analyze_nasdaq_top10_direction(snap_map)
-            if ndx_info["pos_count"] >= 6:
-                st.success(
-                    f"**{ndx_info['overall_badge']}**\n\n"
-                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
-                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
-                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
-                )
-            elif ndx_info["neg_count"] >= 6:
-                st.error(
-                    f"**{ndx_info['overall_badge']}**\n\n"
-                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
-                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
-                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
-                )
-            else:
-                st.warning(
-                    f"**{ndx_info['overall_badge']}**\n\n"
-                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
-                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
-                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
-                )
+            summary_md = (
+                f"**{ndx_info['overall_badge']}**\n\n"
+                f"- **核心籌碼統計**：前十大權重 🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
+                f"（權重合計 `{ndx_info['total_ndx_gex']:+.1f}M`）｜**SPY**: `{ndx_info['spy_gex']:+.1f}M` ｜ "
+                f"**QQQ**: `{ndx_info['qqq_gex']:+.1f}M` ｜ **SMH (費半)**: `{ndx_info['smh_gex']:+.1f}M` ｜ **SOXX**: `{ndx_info['soxx_gex']:+.1f}M`\n"
+                f"- **🏦 ① 法人期權佈局邏輯**：{ndx_info['inst_behavior']}\n"
+                f"- **⚙️ ② 造市商 (Market Maker) 對沖機制**：{ndx_info['mm_mechanism']}\n"
+                f"- **🎯 ③ 整體分析結論與近期操作方針**：\n"
+            )
+            for c_line in ndx_info["conclusion_plan"].split("\n"):
+                summary_md += f"  - {c_line}\n"
 
-            st.markdown("#### 🚦 二、 核心 17 檔（SPY/QQQ/SMH/SOXX + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
+            if ndx_info["pos_count"] >= 6 and (snap_map.get("QQQ") and snap_map["QQQ"].is_positive_gamma):
+                st.success(summary_md)
+            elif ndx_info["neg_count"] >= 6:
+                st.error(summary_md)
+            else:
+                st.warning(summary_md)
+
+            st.markdown("#### 🚦 二、 核心 18 檔（SPY/QQQ/SMH/SOXX/GLD + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
             if "selected_ticker" not in st.session_state:
                 st.session_state["selected_ticker"] = "AAPL"
 
@@ -2230,16 +2487,36 @@ def run_streamlit_warroom() -> None:
                     if sn.call_wall < sn.spot_price
                     else f"${sn.call_wall:.1f}"
                 )
+                iv_crush_lvl = round(sn.iv_peak_pct * 0.94, 1)
+                advice_txt = build_stock_action_advice(sn)
+                if not sn.is_positive_gamma:
+                    squeeze_html = (
+                        f"<div style=\"color:#FFB74D;margin-top:2px;\">"
+                        f"• <b>🚀 向上軋空啟動</b>: ${sn.bull_squeeze_trigger:.1f} ➔ <b>衰竭目標</b>: ${sn.bull_exhaustion_price:.1f}<br>"
+                        f"• <b>🩸 向下破牆啟動</b>: ${sn.bear_squeeze_trigger:.1f} ➔ <b>空頭衰竭</b>: ${sn.bear_exhaustion_price:.1f} "
+                        f"<span style=\"color:#B0BEC5;\">(ATM IV {sn.atm_iv_pct:.1f}% / 衰竭警戒 &lt;{iv_crush_lvl:.1f}%)</span>"
+                        f"</div>"
+                    )
+                else:
+                    squeeze_html = (
+                        f"<div style=\"color:#80D8FF;margin-top:2px;\">"
+                        f"• <b>⚡ 突破轉軋空啟動價</b>: ${sn.bull_squeeze_trigger:.1f} ➔ <b>衰竭天花板</b>: ${sn.bull_exhaustion_price:.1f} "
+                        f"｜ <b>預期波動</b>: ±${sn.expected_move_usd:.1f} (±{sn.expected_move_pct:.1f}%)"
+                        f"</div>"
+                    )
                 card_html = (
                     f"<div class=\"gex-card {cls_name}\">"
-                    f"<div style=\"font-weight:700;font-size:14.5px;color:#FFFFFF;\">"
-                    f"{lamp} ｜ {sn.ticker} <span style=\"color:{chg_col};\">${sn.spot_price:.2f} ({chg_p:+.1f}%)</span>"
+                    f"<div style=\"font-weight:700;font-size:15px;color:#FFFFFF;\">"
+                    f"{lamp} ｜ {sn.ticker} <span style=\"color:{chg_col};\">${sn.spot_price:.2f} ({chg_p:+.1f}%)</span> "
+                    f"<span style=\"color:#FFD54F;font-size:13px;\">｜ Net GEX: {sn.net_gex_millions:+.1f}M</span>"
                     f"</div>"
-                    f"<div style=\"color:#E0E0E0;margin-top:3px;\">"
-                    f"• <b>Put牆</b>: {pw_note} ｜ <b>Call牆</b>: {cw_note}"
+                    f"<div style=\"color:#E0E0E0;margin-top:4px;\">"
+                    f"• <b>Put牆</b>: {pw_note} ｜ <b>Call牆</b>: {cw_note} ｜ <b>痛點</b>: ${sn.max_pain:.1f} ｜ <b>翻轉點</b>: ${sn.zero_gamma_flip:.2f}"
                     f"</div>"
-                    f"<div style=\"color:#B0BEC5;\">"
-                    f"• <b>痛點</b>: ${sn.max_pain:.1f} ｜ <b>翻轉點</b>: ${sn.zero_gamma_flip:.2f} ｜ <b>GEX</b>: {sn.net_gex_millions:+.1f}M"
+                    f"{format_cfd_mapping_line(sn, html_mode=True)}"
+                    f"{squeeze_html}"
+                    f"<div style=\"color:#A5D6A7;margin-top:5px;padding-top:4px;border-top:1px dashed #37474F;font-size:13px;\">"
+                    f"💡 <b>近期操作建議</b>：{advice_txt}"
                     f"</div>"
                     f"</div>"
                 )
@@ -2248,7 +2525,7 @@ def run_streamlit_warroom() -> None:
                     if st.button(f"📈 查看 {sn.ticker} 日K與GEX圖", key=f"lamp_{tk_sym}", use_container_width=True):
                         st.session_state["selected_ticker"] = tk_sym
 
-            # 第 1 列專門放「大盤與費半四指標 (SPY / QQQ / SMH / SOXX)」，確保手機版 QQQ 永遠緊接在 SPY 正下方
+            # 第 1 列專門放「大盤、費半與黃金五指標 (SPY / QQQ / SMH / SOXX / GLD)」，確保手機版 QQQ 永遠緊接在 SPY 正下方
             idx_tks = [t for t in quick_14_list if t in MARKET_INDEX_TICKERS]
             if idx_tks:
                 idx_cols = st.columns(len(idx_tks))
@@ -2476,7 +2753,7 @@ def run_streamlit_warroom() -> None:
             u_mode = st.selectbox(
                 "選擇掃描股票池範圍",
                 [
-                    "CUSTOM (掃描 SPY/QQQ/SMH/SOXX + 13 檔核心自選股)",
+                    "CUSTOM (掃描 SPY/QQQ/SMH/SOXX/GLD + 13 檔核心自選股)",
                     "SP500_NDX100 (標普 500 + 納斯達克 100 全成分股快篩)",
                     "ALL_US (SEC 全美股 5,000+ 檔 + 第一階段量價異動快篩)",
                     "MOST_ACTIVE (全美股 130 檔高期權流動性核心池)",
@@ -2490,7 +2767,7 @@ def run_streamlit_warroom() -> None:
         if u_mode.startswith("CUSTOM"):
             custom_str = st.text_input(
                 "輸入欲批次掃描之美股代號",
-                value="SPY, QQQ, SMH, SOXX, " + core_wl_str,
+                value="SPY, QQQ, SMH, SOXX, GLD, " + core_wl_str,
             )
 
         if st.button("🚀 立即手動執行一次批次掃描", type="primary"):
