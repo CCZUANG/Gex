@@ -2,25 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-全美股期權 GEX 戰情室 & Telegram 自動推播系統 (雙軌分工 + 每日開盤前自動早報旗艦版)
+全美股期權 GEX 戰情室 & Telegram 自動推播系統 (日K對齊 + 首頁14檔燈號 + 納指方向研判版)
 ===============================================================================
-更新時間: 2026-11-14 23:40:00 (UTC+8)
+更新時間: 2026-11-15 10:38:00 (UTC+8)
 
-【本次升級重點】：
-1. 內建「🌅 每日美股開盤前 15 分鐘自動早報 (Morning Briefing)」：
-   - 每個美股交易日於美東時間 09:15 (冬令台灣時間 22:15 UTC+8 / 夏令 21:15 UTC+8)，
-     VPS 後台自動掃描並發送完整早報至你的手機 Telegram (側邊欄亦可隨時一鍵手動發送)。
-   - 早報完整涵蓋：
-     (a) 大盤雙指標 (SPY & QQQ)：完整列出正負 Gamma、Net GEX、翻轉點、Call牆、Put牆、Max Pain、預期波動。
-     (b) 核心自選股 12 檔 (NVDA, TSLA, LUNR, SPCX + 納斯達克前十大權重股 AAPL, MSFT, AMZN, AVGO, META, GOOGL, COST, NFLX)。
-     (c) 全美股「臨門一腳」蓄勢名單 (現價距離 Squeeze 啟動價或支撐壓力牆 <= 1.5% 之高量比標的)。
-     (d) 結算日 DTE 與 Charm 尾盤平倉時間窗提醒。
-2. 網頁頂部快捷按鈕同步升級為 14 顆核心按鈕 (SPY, QQQ + 12 檔核心自選股)，手機一點即看。
-3. 智慧期權鏈回退機制：若特定標的 (如剛上市或期權流動性較低之個股) 暫無期權鏈，自動以現貨籌碼密集區與 ATR/HV 推算等效支撐壓力牆，確保 12 檔核心自選股 100% 完整呈現不漏檔。
+【本次針對 4 張實機截圖之全面升級】：
+1. K 線全面對齊看盤軟體「日 K 線 (Daily K-Bars + MA5/MA10/MA20)」：
+   • 修正原本抓 15 分鐘 K 線導致形狀與富途牛牛日 K 對不起來、且 X 軸只有 0~40 編號的問題。
+   • 改為抓取標準近 45 個交易日之「日 K 線 (1D)」，疊加 MA5(橘)、MA10(青)、MA20(紫)，X 軸顯示真實 MM/DD 日期。
+2. 徹底解決手機版 Streamlit 圖表與文字重疊、縮放跑版問題：
+   • 採用 `xaxis_type="category"` 消除週末休市空白斷層，K 線 100% 填滿手機畫面。
+   • 將「日 K 線支撐壓力圖」與「各履約價 GEX 柱狀圖」改為上下獨立滿版排列，並將價位線標籤改為右側防重疊膠囊與圖例，手機滑動不再亂跑或字體互疊。
+3. 網站一打開預設直接顯示「納斯達克前十大 Gamma 總體方向研判」+「核心 14 檔正負 Gamma 即時燈號牆」：
+   • 首頁自動統計 QQQ 與納指前十大權重股之正負 Gamma 家數比、總淨曝險 (Net GEX) 與操作方向建議，並以紅綠燈卡片展示 14 檔核心股。
+4. 重新設計 Telegram 早報排版與嚴格區分現價上下之 Call/Put 牆：
+   • 強制規定 Call 牆必須 `> 現價`、Put 牆必須 `< 現價`（解決 Put 牆高於現價或與 Call 牆重疊之問題），並新增納指前十大方向總結與清爽三行式早報排版。
 """
 
 import importlib
 import os
+import re
+import socket
 import subprocess
 import sys
 
@@ -39,7 +41,6 @@ REQUIRED_PACKAGES = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IS_WINDOWS_VPS = os.name == "nt"
 
-# 核心自選股：NVDA, TSLA, LUNR, SPCX + 納斯達克前十大股票 (去重後共 12 檔核心股)
 DEFAULT_CORE_WATCHLIST = [
     "NVDA",
     "TSLA",
@@ -55,6 +56,18 @@ DEFAULT_CORE_WATCHLIST = [
     "NFLX",
 ]
 MARKET_INDEX_TICKERS = ["SPY", "QQQ"]
+NASDAQ_TOP10_TICKERS = [
+    "AAPL",
+    "NVDA",
+    "MSFT",
+    "AMZN",
+    "AVGO",
+    "META",
+    "TSLA",
+    "GOOGL",
+    "COST",
+    "NFLX",
+]
 
 
 def auto_generate_github_deployment_files() -> None:
@@ -100,10 +113,14 @@ def is_running_inside_streamlit() -> bool:
 if __name__ == "__main__" and not is_running_inside_streamlit():
     auto_generate_github_deployment_files()
     auto_ensure_dependencies()
-    if "--patrol" not in sys.argv and "--test-self" not in sys.argv:
+    if (
+        "--patrol" not in sys.argv
+        and "--test-self" not in sys.argv
+        and "--morning" not in sys.argv
+        and "--daemon-loop" not in sys.argv
+    ):
         print("🚀 正在啟動 Windows VPS 全美股 GEX 戰情室與 24H 後台推播守護程序...")
         print("   • 本機設定網址: http://localhost:8501 (不需開放 VPS 防火牆)")
-        print("   • 填妥一次 Telegram 金鑰後，把此黑色視窗最小化即可 24 小時自動推播早報與盤中異動！")
         script_path = os.path.abspath(__file__)
         sys.exit(
             subprocess.call(
@@ -127,6 +144,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import json
 import math
+import ssl
 import threading
 import time
 import urllib.parse
@@ -141,6 +159,15 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+try:
+    import urllib3
+    import urllib3.util.connection as urllib3_cn
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
 
 
 def configure_cjk_font() -> None:
@@ -172,28 +199,114 @@ configure_cjk_font()
 CONFIG_FILE_PATH = os.path.join(BASE_DIR, "gex_user_config.json")
 STATE_FILE_PATH = os.path.join(BASE_DIR, "gex_iv_alert_state.json")
 STATE_LOCK = threading.Lock()
+MT5_CSV_LOCK = threading.Lock()
 
 
-def register_windows_startup() -> Tuple[bool, str]:
+def sanitize_tg_credentials(token: str, chat_id: str) -> Tuple[str, str]:
+    clean_tok = re.sub(r"[^0-9a-zA-Z:_-]", "", str(token or ""))
+    clean_cid = re.sub(r"[^0-9-]", "", str(chat_id or ""))
+    return clean_tok, clean_cid
+
+
+def get_mt5_common_files_dir() -> str:
+    appdata = os.environ.get("APPDATA", "")
+    if IS_WINDOWS_VPS and appdata:
+        mt5_common = os.path.join(appdata, "MetaQuotes", "Terminal", "Common", "Files")
+        try:
+            os.makedirs(mt5_common, exist_ok=True)
+            return mt5_common
+        except Exception:
+            pass
+    return BASE_DIR
+
+
+def export_snapshot_to_mt5_common_csv(snap) -> str:
+    header = (
+        "Ticker,SpotPrice,IsPosGamma,NetGEX_M,ZeroGamma,CallWall,PutWall,MaxPain,"
+        "BullTrigger,BearTrigger,BullExhaust,BearExhaust,ATM_IV,IV_Peak,IV_DropPct,"
+        "DTE,ActiveAlertCode,UpdatedTW"
+    )
+    alert_code = snap.active_alerts[0].code if snap.active_alerts else "NONE"
+    clean_tw = str(snap.timestamp_tw).replace(",", " ")
+    row_str = (
+        f"{snap.ticker.upper()},{snap.spot_price:.4f},{1 if snap.is_positive_gamma else 0},"
+        f"{snap.net_gex_millions:.2f},{snap.zero_gamma_flip:.4f},{snap.call_wall:.4f},"
+        f"{snap.put_wall:.4f},{snap.max_pain:.4f},{snap.bull_squeeze_trigger:.4f},"
+        f"{snap.bear_squeeze_trigger:.4f},{snap.bull_exhaustion_price:.4f},"
+        f"{snap.bear_exhaustion_price:.4f},{snap.atm_iv_pct:.2f},{snap.iv_peak_pct:.2f},"
+        f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw}"
+    )
+
+    target_dirs = {BASE_DIR, get_mt5_common_files_dir()}
+    primary_csv = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
+
+    with MT5_CSV_LOCK:
+        for d in target_dirs:
+            csv_path = os.path.join(d, "gex_mt5_levels.csv")
+            existing_rows = {}
+            if os.path.exists(csv_path):
+                try:
+                    with open(csv_path, "r", encoding="utf-8") as rf:
+                        for line in rf:
+                            s = line.strip()
+                            if not s or s.startswith("Ticker,"):
+                                continue
+                            tk_key = s.split(",", 1)[0].strip().upper()
+                            if tk_key:
+                                existing_rows[tk_key] = s
+                except Exception:
+                    pass
+            existing_rows[snap.ticker.upper()] = row_str
+            try:
+                with open(csv_path, "w", encoding="utf-8") as wf:
+                    wf.write(header + "\n")
+                    for k in sorted(existing_rows.keys()):
+                        wf.write(existing_rows[k] + "\n")
+            except Exception:
+                pass
+    return primary_csv
+
+
+def enable_invisible_windows_background_service() -> Tuple[bool, str]:
     if not IS_WINDOWS_VPS:
-        return False, "目前為雲端 Linux 環境，無需建立 Windows 開機啟動捷徑。"
+        return False, "目前非 Windows 系統，無需設定 Windows 隱形背景常駐。"
     try:
         appdata = os.environ.get("APPDATA", "")
         startup_dir = os.path.join(
             appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
         )
         os.makedirs(startup_dir, exist_ok=True)
-        bat_path = os.path.join(startup_dir, "GEX_Auto_WarRoom_Startup.bat")
+
+        old_bat = os.path.join(startup_dir, "GEX_Auto_WarRoom_Startup.bat")
+        if os.path.exists(old_bat):
+            try:
+                os.remove(old_bat)
+            except Exception:
+                pass
+
         script_abs = os.path.abspath(__file__)
         py_exe = sys.executable
-        content = (
-            f"@echo off\n"
-            f"cd /d \"{BASE_DIR}\"\n"
-            f"start \"GEX_Auto_WarRoom\" \"{py_exe}\" \"{script_abs}\"\n"
+        vbs_path = os.path.join(startup_dir, "GEX_Invisible_Daemon.vbs")
+
+        vbs_content = (
+            'Set WshShell = CreateObject("WScript.Shell")\n'
+            f'WshShell.CurrentDirectory = "{BASE_DIR}"\n'
+            f'WshShell.Run """{py_exe}"" ""{script_abs}"" --daemon-loop", 0, False\n'
         )
-        with open(bat_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return True, bat_path
+        with open(vbs_path, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
+
+        creation_flags = 0x08000000 | 0x00000008  # CREATE_NO_WINDOW | DETACHED_PROCESS
+        subprocess.Popen(
+            [py_exe, script_abs, "--daemon-loop"],
+            cwd=BASE_DIR,
+            creationflags=creation_flags,
+            close_fds=True,
+        )
+        return (
+            True,
+            f"已啟動無黑窗隱形背景程序並寫入開機自啟 ({vbs_path})！你現在可以直接把黑色的 CMD 視窗關掉了。",
+        )
     except Exception as exc:
         return False, str(exc)
 
@@ -234,11 +347,22 @@ def load_user_config() -> Dict:
                     default_cfg[k] = v
         except Exception:
             pass
+
+    c_tok, c_cid = sanitize_tg_credentials(
+        default_cfg.get("tg_token", ""), default_cfg.get("tg_chat_id", "")
+    )
+    default_cfg["tg_token"] = c_tok
+    default_cfg["tg_chat_id"] = c_cid
     return default_cfg
 
 
 def save_user_config(cfg: Dict) -> None:
     try:
+        c_tok, c_cid = sanitize_tg_credentials(
+            cfg.get("tg_token", ""), cfg.get("tg_chat_id", "")
+        )
+        cfg["tg_token"] = c_tok
+        cfg["tg_chat_id"] = c_cid
         with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -274,15 +398,10 @@ def is_us_market_active_window() -> bool:
 
 
 def is_premarket_briefing_window() -> bool:
-    """
-    判斷是否進入每日美股開盤前 15~25 分鐘早報發送窗口：
-    美東時間 09:10 ~ 09:25 (冬令對應台灣時間 22:10 ~ 22:25 UTC+8，夏令對應 21:10 ~ 21:25 UTC+8)。
-    """
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     if now_utc.weekday() >= 5:
         return False
     utc_hm = now_utc.hour * 60 + now_utc.minute
-    # 夏令美東 09:10~09:25 = UTC 13:10~13:25 (790~805); 冬令美東 09:10~09:25 = UTC 14:10~14:25 (850~865)
     return (790 <= utc_hm <= 808) or (850 <= utc_hm <= 868)
 
 
@@ -323,6 +442,7 @@ def parse_watchlist_string(raw_str: str) -> List[str]:
 
 def fetch_sp500_and_nasdaq100_tickers() -> List[str]:
     tickers = set(DEFAULT_HIGH_OPTION_LIQUIDITY_POOL)
+    ssl_ctx = ssl._create_unverified_context()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     for url in [
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -330,7 +450,7 @@ def fetch_sp500_and_nasdaq100_tickers() -> List[str]:
     ]:
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
                 html = resp.read().decode("utf-8")
             for df_t in pd.read_html(html):
                 for col in ["Symbol", "Ticker"]:
@@ -344,12 +464,13 @@ def fetch_sp500_and_nasdaq100_tickers() -> List[str]:
 
 
 def fetch_all_us_sec_tickers() -> List[str]:
+    ssl_ctx = ssl._create_unverified_context()
     headers = {"User-Agent": "QuantOptionsGEXScanner/3.0 (contact@quant-research.local)"}
     try:
         req = urllib.request.Request(
             "https://www.sec.gov/files/company_tickers.json", headers=headers
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=12, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         raw_tickers = [str(v["ticker"]).upper().replace(".", "-") for v in data.values()]
         clean = [
@@ -433,40 +554,81 @@ def bs_greeks(
     strikes: np.ndarray,
     tte_years: float,
     iv: np.ndarray,
-    rate: float = 0.045,
-    div_yield: float = 0.0,
+    risk_free_rate: float = 0.045,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    T = max(tte_years, 1.0 / (365.0 * 24.0))
-    sigma = np.clip(iv, 0.05, 5.0)
-    sqrt_T = np.sqrt(T)
+    T = max(float(tte_years), 1.0 / (365.0 * 24.0))
+    sigma = np.clip(iv.astype(float), 0.05, 5.0)
+    K = np.maximum(strikes.astype(float), 0.01)
+    S = max(float(spot), 0.01)
 
-    d1 = (np.log(spot / strikes) + (rate - div_yield + 0.5 * sigma**2) * T) / (
-        sigma * sqrt_T
-    )
+    sqrt_T = math.sqrt(T)
+    d1 = (np.log(S / K) + (risk_free_rate + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
 
     pdf_d1 = norm_pdf(d1)
     cdf_d1 = norm_cdf(d1)
-    disc_q = np.exp(-div_yield * T)
 
-    call_delta = disc_q * cdf_d1
-    put_delta = disc_q * (cdf_d1 - 1.0)
-    gamma = (disc_q * pdf_d1) / (spot * sigma * sqrt_T)
-    vanna = -disc_q * pdf_d1 * (d2 / sigma)
-    charm_daily = (
-        -disc_q
-        * (pdf_d1 * ((rate - div_yield) / (sigma * sqrt_T) - d2 / (2.0 * T)))
-        / 365.0
+    call_delta = cdf_d1
+    put_delta = cdf_d1 - 1.0
+    gamma = pdf_d1 / (S * sigma * sqrt_T)
+    vanna = -pdf_d1 * (d2 / sigma)
+    charm = -pdf_d1 * (
+        (2.0 * risk_free_rate * T - d2 * sigma * sqrt_T) / (2.0 * T * sigma * sqrt_T)
     )
-    return call_delta, put_delta, gamma, vanna, charm_daily
+    return call_delta, put_delta, gamma, vanna, charm
 
 
 def dealer_call_polarity(
     call_vol: np.ndarray, call_oi: np.ndarray, call_iv: np.ndarray
 ) -> np.ndarray:
     vol_oi = call_vol / np.maximum(call_oi, 1.0)
-    is_customer_buying_call = (vol_oi >= 0.85) & (call_iv >= 0.65)
-    return np.where(is_customer_buying_call, -1.0, 1.0)
+    return np.where((vol_oi >= 0.85) & (call_iv >= 0.65), -1.0, 1.0)
+
+
+def compute_max_pain(df_chain: pd.DataFrame) -> float:
+    strikes = df_chain["strike"].values.astype(float)
+    call_oi = df_chain["call_oi"].values.astype(float)
+    put_oi = df_chain["put_oi"].values.astype(float)
+
+    payouts = []
+    for s_test in strikes:
+        c_loss = np.sum(np.maximum(0.0, s_test - strikes) * call_oi)
+        p_loss = np.sum(np.maximum(0.0, strikes - s_test) * put_oi)
+        payouts.append(c_loss + p_loss)
+    return float(strikes[int(np.argmin(payouts))])
+
+
+def find_zero_gamma_flip(
+    spot: float,
+    strikes: np.ndarray,
+    call_oi: np.ndarray,
+    put_oi: np.ndarray,
+    call_iv: np.ndarray,
+    put_iv: np.ndarray,
+    tte_years: float,
+) -> float:
+    low_s = max(float(np.min(strikes)) * 0.90, spot * 0.75)
+    high_s = min(float(np.max(strikes)) * 1.10, spot * 1.25)
+    grid = np.linspace(low_s, high_s, 140)
+
+    net_curve = []
+    for s_val in grid:
+        _, _, c_gam, _, _ = bs_greeks(s_val, strikes, tte_years, call_iv)
+        _, _, p_gam, _, _ = bs_greeks(s_val, strikes, tte_years, put_iv)
+        c_gex = np.sum(call_oi * c_gam * 100.0 * (s_val**2) * 0.01)
+        p_gex = np.sum(-put_oi * p_gam * 100.0 * (s_val**2) * 0.01)
+        net_curve.append(c_gex + p_gex)
+
+    arr = np.array(net_curve)
+    signs = np.sign(arr)
+    crossings = np.where(np.diff(signs) != 0)[0]
+    if len(crossings) > 0:
+        best_idx = min(crossings, key=lambda idx: abs(grid[idx] - spot))
+        x0, x1 = grid[best_idx], grid[best_idx + 1]
+        y0, y1 = arr[best_idx], arr[best_idx + 1]
+        if abs(y1 - y0) > 1e-9:
+            return round(float(x0 - y0 * (x1 - x0) / (y1 - y0)), 2)
+    return round(float(grid[int(np.argmin(np.abs(arr)))]), 2)
 
 
 @dataclass
@@ -498,87 +660,20 @@ class WarRoomSnapshot:
     iv_drop_from_peak_pct: float
     expected_move_usd: float
     expected_move_pct: float
-
     net_gex_millions: float
     zero_gamma_flip: float
     is_positive_gamma: bool
-
     call_wall: float
     put_wall: float
+    next_upper_call_wall: float
+    next_lower_put_wall: float
     max_pain: float
-
     bull_squeeze_trigger: float
     bear_squeeze_trigger: float
     bull_exhaustion_price: float
     bear_exhaustion_price: float
     charm_unwind_time_tw: str
-
     active_alerts: List[AlertSignal]
-
-
-def compute_max_pain(df_chain: pd.DataFrame) -> float:
-    strikes = df_chain["strike"].values
-    call_oi = df_chain["call_oi"].values
-    put_oi = df_chain["put_oi"].values
-    payouts = [
-        np.sum(
-            np.maximum(0.0, s_exp - strikes) * call_oi * 100.0
-            + np.maximum(0.0, strikes - s_exp) * put_oi * 100.0
-        )
-        for s_exp in strikes
-    ]
-    return float(strikes[int(np.argmin(payouts))])
-
-
-def total_net_gex_at_price(
-    test_spot: float,
-    strikes: np.ndarray,
-    call_oi: np.ndarray,
-    put_oi: np.ndarray,
-    call_iv: np.ndarray,
-    put_iv: np.ndarray,
-    tte_years: float,
-) -> float:
-    _, _, gamma_c, _, _ = bs_greeks(test_spot, strikes, tte_years, call_iv)
-    _, _, gamma_p, _, _ = bs_greeks(test_spot, strikes, tte_years, put_iv)
-    gex_d = (call_oi * gamma_c - put_oi * gamma_p) * 100.0 * (test_spot**2) * 0.01
-    return float(np.sum(gex_d) / 1e6)
-
-
-def find_zero_gamma_flip(
-    spot: float,
-    strikes: np.ndarray,
-    call_oi: np.ndarray,
-    put_oi: np.ndarray,
-    call_iv: np.ndarray,
-    put_iv: np.ndarray,
-    tte_years: float,
-) -> float:
-    low_s = max(float(np.min(strikes)), spot * 0.75)
-    high_s = min(float(np.max(strikes)), spot * 1.25)
-    grid = np.linspace(low_s, high_s, 60)
-    gex_vals = [
-        total_net_gex_at_price(s, strikes, call_oi, put_oi, call_iv, put_iv, tte_years)
-        for s in grid
-    ]
-
-    best_flip = None
-    min_dist = float("inf")
-    for i in range(len(grid) - 1):
-        if gex_vals[i] * gex_vals[i + 1] <= 0:
-            denom = gex_vals[i + 1] - gex_vals[i]
-            flip_p = (
-                grid[i]
-                if abs(denom) < 1e-9
-                else grid[i] - gex_vals[i] * (grid[i + 1] - grid[i]) / denom
-            )
-            if abs(flip_p - spot) < min_dist:
-                min_dist = abs(flip_p - spot)
-                best_flip = flip_p
-
-    if best_flip is not None:
-        return round(float(best_flip), 2)
-    return round(float(grid[int(np.argmin(np.abs(gex_vals)))]), 2)
 
 
 def evaluate_snapshot_and_alerts(
@@ -591,9 +686,7 @@ def evaluate_snapshot_and_alerts(
     simulated_iv_peak_pct: Optional[float] = None,
 ) -> Tuple[WarRoomSnapshot, pd.DataFrame]:
     spot = float(df_ohlcv["Close"].iloc[-1])
-    prev_close = (
-        float(df_ohlcv["Close"].iloc[-2]) if len(df_ohlcv) >= 2 else spot * 0.99
-    )
+    prev_close = float(df_ohlcv["Close"].iloc[-2]) if len(df_ohlcv) >= 2 else spot
     high_curr = float(df_ohlcv["High"].iloc[-1])
     low_curr = float(df_ohlcv["Low"].iloc[-1])
     open_curr = float(df_ohlcv["Open"].iloc[-1])
@@ -617,9 +710,13 @@ def evaluate_snapshot_and_alerts(
     _, _, p_gamma, _, _ = bs_greeks(spot, strikes, tte_years, put_iv)
 
     call_pol = dealer_call_polarity(call_vol, call_oi, call_iv)
-    df["call_gex_raw_m"] = (call_oi * c_gamma * 100.0 * (spot**2) * 0.01) / 1e6
+    if "pre_call_gex_m" in df.columns and "pre_put_gex_m" in df.columns:
+        df["call_gex_raw_m"] = df["pre_call_gex_m"].values.astype(float)
+        df["put_gex_m"] = df["pre_put_gex_m"].values.astype(float)
+    else:
+        df["call_gex_raw_m"] = (call_oi * c_gamma * 100.0 * (spot**2) * 0.01) / 1e6
+        df["put_gex_m"] = (-put_oi * p_gamma * 100.0 * (spot**2) * 0.01) / 1e6
     df["call_gex_m"] = df["call_gex_raw_m"] * call_pol
-    df["put_gex_m"] = (-put_oi * p_gamma * 100.0 * (spot**2) * 0.01) / 1e6
     df["net_gex_m"] = df["call_gex_m"] + df["put_gex_m"]
     df["call_vol_oi"] = call_vol / np.maximum(call_oi, 1.0)
     df["put_vol_oi"] = put_vol / np.maximum(put_oi, 1.0)
@@ -648,21 +745,44 @@ def evaluate_snapshot_and_alerts(
     expected_move_pct = (atm_iv_pct / 100.0) * math.sqrt(tte_years)
     expected_move_usd = spot * expected_move_pct
 
-    upper_df = df[df["strike"] >= spot * 0.98]
-    call_wall = float(
-        upper_df.loc[upper_df["call_gex_raw_m"].idxmax(), "strike"]
-        if not upper_df.empty
-        else df.loc[df["call_gex_raw_m"].idxmax(), "strike"]
-    )
-    lower_df = df[df["strike"] <= spot * 1.02]
-    put_wall = float(
-        lower_df.loc[lower_df["put_gex_m"].idxmin(), "strike"]
-        if not lower_df.empty
-        else df.loc[df["put_gex_m"].idxmin(), "strike"]
-    )
+    # 1. 100% 純粹依據造市商 Gamma Exposure (GEX) 決定主力 Call 牆與主力 Put 牆：
+    # • 主力 Call 牆：全場正 Gamma 曝險 (Call GEX / Net GEX > 0) 最大的履約價（對應右側圖表最長綠柱）。
+    # • 主力 Put 牆：全場負向 Put Gamma 佔優 (Net GEX < 0，即 Put GEX 超過 Call GEX，對應右側圖表最長紅柱)
+    #   或全場負向 Put GEX 絕對值最大的獨立履約價，絕不摻雜人為 OI 權重，亦不與正向 Call 牆重疊於同一綠柱。
+    pos_net_df = df[df["net_gex_m"] > 0]
+    if not pos_net_df.empty:
+        call_wall = float(pos_net_df.loc[pos_net_df["call_gex_raw_m"].idxmax(), "strike"])
+    else:
+        call_wall = float(df.loc[df["call_gex_raw_m"].idxmax(), "strike"])
+
+    neg_net_df = df[df["net_gex_m"] < 0]
+    if not neg_net_df.empty:
+        put_wall = float(neg_net_df.loc[neg_net_df["put_gex_m"].idxmin(), "strike"])
+    else:
+        non_cw_df = df[df["strike"] != call_wall]
+        put_wall = float(
+            non_cw_df.loc[non_cw_df["put_gex_m"].idxmin(), "strike"]
+            if not non_cw_df.empty
+            else df.loc[df["put_gex_m"].idxmin(), "strike"]
+        )
+
+    # 2. 若主力 Call 牆已被現價站上 (call_wall <= spot，轉為正 Gamma 磁吸支撐)，同時標出上方最大 Call GEX 次級壓力牆
+    upper_df = df[df["strike"] > spot * 1.001]
+    if not upper_df.empty:
+        next_upper_call_wall = float(upper_df.loc[upper_df["call_gex_raw_m"].idxmax(), "strike"])
+    else:
+        next_upper_call_wall = round(spot * 1.03, 2)
+
+    # 若主力 Put 牆已被現價跌破 (put_wall >= spot，轉為負 Gamma 破牆反壓)，同時標出下方最大 Put GEX 次級支撐牆
+    lower_df = df[df["strike"] < spot * 0.999]
+    if not lower_df.empty:
+        next_lower_put_wall = float(lower_df.loc[lower_df["put_gex_m"].idxmin(), "strike"])
+    else:
+        next_lower_put_wall = round(spot * 0.97, 2)
+
     max_pain = compute_max_pain(df)
 
-    bull_cands = df[(df["strike"] >= spot * 0.96) & (df["strike"] <= spot * 1.10)].copy()
+    bull_cands = df[(df["strike"] > spot) & (df["strike"] <= spot * 1.12)].copy()
     if not bull_cands.empty:
         bull_cands["sq_score"] = bull_cands["call_gex_raw_m"] * (
             1.0 + bull_cands["call_vol_oi"]
@@ -671,7 +791,7 @@ def evaluate_snapshot_and_alerts(
     else:
         bull_trigger = call_wall
 
-    bear_cands = df[(df["strike"] <= spot * 1.04) & (df["strike"] >= spot * 0.90)].copy()
+    bear_cands = df[(df["strike"] < spot) & (df["strike"] >= spot * 0.88)].copy()
     if not bear_cands.empty:
         bear_cands["cr_score"] = np.abs(bear_cands["put_gex_m"]) * (
             1.0 + bear_cands["put_vol_oi"]
@@ -687,7 +807,7 @@ def evaluate_snapshot_and_alerts(
     else:
         term_call = round(spot + expected_move_usd, 2)
     bull_exhaust = round(
-        max(bull_trigger * 1.03, min(term_call, spot + 1.25 * expected_move_usd)), 2
+        max(bull_trigger * 1.025, min(term_call, spot + 1.25 * expected_move_usd)), 2
     )
 
     far_puts = df[df["strike"] < bear_trigger]
@@ -697,11 +817,11 @@ def evaluate_snapshot_and_alerts(
     else:
         term_put = round(spot - expected_move_usd, 2)
     bear_exhaust = round(
-        min(bear_trigger * 0.97, max(term_put, spot - 1.25 * expected_move_usd)), 2
+        min(bear_trigger * 0.975, max(term_put, spot - 1.25 * expected_move_usd)), 2
     )
 
     try:
-        exp_dt = datetime.datetime.strptime(expiration_date, "%Y-%m-%d")
+        exp_dt = datetime.datetime.strptime(expiration_date[:10], "%Y-%m-%d")
         charm_tw_str = (exp_dt + datetime.timedelta(days=1, hours=3)).strftime(
             "%Y-%m-%d %H:%M:%S (UTC+8)"
         )
@@ -845,6 +965,8 @@ def evaluate_snapshot_and_alerts(
         is_positive_gamma=is_pos_gamma,
         call_wall=call_wall,
         put_wall=put_wall,
+        next_upper_call_wall=next_upper_call_wall,
+        next_lower_put_wall=next_lower_put_wall,
         max_pain=max_pain,
         bull_squeeze_trigger=bull_trigger,
         bear_squeeze_trigger=bear_trigger,
@@ -853,124 +975,175 @@ def evaluate_snapshot_and_alerts(
         charm_unwind_time_tw=charm_tw_str,
         active_alerts=alerts,
     )
+    try:
+        export_snapshot_to_mt5_common_csv(snapshot)
+    except Exception:
+        pass
     return snapshot, df
 
 
 # ============================================================================
-# 3. 高解析度「左 K 線 + 右 GEX 柱狀圖 + 底部戰情卡」雙拼圖繪製器
+# 3. 高解析度「標準日K線 (含MA5/10/20 + 日期軸) + 右側GEX牆 + 防重疊標籤」繪製器
 # ============================================================================
+def extract_mmdd_labels(df_plot: pd.DataFrame) -> List[str]:
+    labels = []
+    idx_vals = df_plot.index
+    if "Date" in df_plot.columns:
+        idx_vals = df_plot["Date"]
+    elif "Datetime" in df_plot.columns:
+        idx_vals = df_plot["Datetime"]
+
+    for idx_v in idx_vals:
+        s = str(idx_v)
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+        if m:
+            labels.append(f"{m.group(2)}/{m.group(3)}")
+        else:
+            labels.append(s[:5])
+    return labels
+
+
 def render_warroom_chart_png(
     snap: WarRoomSnapshot,
     df_ohlcv: pd.DataFrame,
     df_chain: pd.DataFrame,
     output_path: str,
 ) -> str:
-    fig = plt.figure(figsize=(15, 9.2), dpi=160, facecolor="#0E1117")
+    fig = plt.figure(figsize=(15.5, 9.5), dpi=160, facecolor="#0E1117")
     gs = fig.add_gridspec(
-        2, 2, width_ratios=[3.1, 1.2], height_ratios=[4.2, 1.35], hspace=0.22, wspace=0.06
+        2, 2, width_ratios=[3.15, 1.15], height_ratios=[4.3, 1.35], hspace=0.25, wspace=0.08
     )
 
     ax_k = fig.add_subplot(gs[0, 0], facecolor="#131722")
     ax_gex = fig.add_subplot(gs[0, 1], sharey=ax_k, facecolor="#131722")
     ax_card = fig.add_subplot(gs[1, :], facecolor="#161B26")
 
-    df_plot = df_ohlcv.tail(45).reset_index(drop=True)
+    df_full = df_ohlcv.copy()
+    df_full["MA5"] = df_full["Close"].rolling(5, min_periods=1).mean()
+    df_full["MA10"] = df_full["Close"].rolling(10, min_periods=1).mean()
+    df_full["MA20"] = df_full["Close"].rolling(20, min_periods=1).mean()
 
-    y_min = min(float(df_plot["Low"].min()), snap.put_wall, snap.bear_exhaustion_price) * 0.985
-    y_max = max(float(df_plot["High"].max()), snap.call_wall, snap.bull_exhaustion_price) * 1.015
+    # 聚焦最近 22 個交易日之日 K 線，並以「近 12 日高低點 + 期權牆區間」決定 Y 軸上下界，
+    # 避免兩個月前過高或過低的歷史價位把 Y 軸拉得太遠，導致現價附近的 Call/Put 牆擠在一起！
+    df_plot = df_full.tail(22).copy()
+    date_labels = extract_mmdd_labels(df_plot)
+    df_plot = df_plot.reset_index(drop=True)
+
+    recent_focus = df_plot.tail(12)
+    k_low = float(recent_focus["Low"].min())
+    k_high = float(recent_focus["High"].max())
+    y_min = min(k_low, snap.put_wall, snap.next_lower_put_wall, snap.zero_gamma_flip) * 0.988
+    y_max = max(k_high, snap.call_wall, snap.next_upper_call_wall, snap.bull_exhaustion_price) * 1.012
 
     if snap.is_positive_gamma:
-        ax_k.axhspan(snap.zero_gamma_flip, y_max, color="#00E676", alpha=0.05)
-        ax_k.axhspan(y_min, snap.zero_gamma_flip, color="#FF1744", alpha=0.04)
+        ax_k.axhspan(snap.zero_gamma_flip, y_max, color="#00E676", alpha=0.04)
+        ax_k.axhspan(y_min, snap.zero_gamma_flip, color="#FF1744", alpha=0.03)
     else:
-        ax_k.axhspan(y_min, y_max, color="#FF1744", alpha=0.05)
+        ax_k.axhspan(y_min, y_max, color="#FF1744", alpha=0.04)
+
+    # 繪製日 K 線與 MA5 / MA10 / MA20 (對齊富途牛牛日K圖風格)
+    x_arr = np.arange(len(df_plot))
+    ax_k.plot(x_arr, df_plot["MA5"].values, color="#FF9800", linewidth=1.3, label="MA5", zorder=4)
+    ax_k.plot(x_arr, df_plot["MA10"].values, color="#29B6F6", linewidth=1.3, label="MA10", zorder=4)
+    ax_k.plot(x_arr, df_plot["MA20"].values, color="#AB47BC", linewidth=1.4, label="MA20", zorder=4)
 
     for i, row in df_plot.iterrows():
-        o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+        o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
         color = "#00E676" if c >= o else "#FF5252"
-        ax_k.plot([i, i], [l, h], color=color, linewidth=1.3, zorder=3)
+        ax_k.plot([i, i], [l, h], color=color, linewidth=1.35, zorder=3)
         body_bottom = min(o, c)
-        body_h = max(abs(c - o), (y_max - y_min) * 0.002)
+        body_h = max(abs(c - o), (y_max - y_min) * 0.0025)
         rect = mpatches.Rectangle(
-            (i - 0.32, body_bottom), 0.64, body_h, facecolor=color, edgecolor=color, zorder=4
+            (i - 0.32, body_bottom), 0.64, body_h, facecolor=color, edgecolor=color, zorder=5
         )
         ax_k.add_patch(rect)
 
-    levels_raw = [
-        (snap.call_wall, f"Call 壓力牆 ${snap.call_wall:.1f}", "#FF5252", "-", 2.0, 0.5),
-        (snap.put_wall, f"Put 支撐牆 ${snap.put_wall:.1f}", "#00E676", "-", 2.0, 0.5),
-        (snap.zero_gamma_flip, f"Zero Gamma 翻轉點 ${snap.zero_gamma_flip:.2f}", "#FFD600", "--", 2.0, 0.5),
-        (snap.max_pain, f"Max Pain 最大痛點 ${snap.max_pain:.1f}", "#40C4FF", ":", 1.8, 10.5),
-        (snap.bull_squeeze_trigger, f"Squeeze 向上啟動 ${snap.bull_squeeze_trigger:.1f}", "#FF9100", "-.", 1.8, 10.5),
-        (snap.bull_exhaustion_price, f"Squeeze 衰竭天花板 ${snap.bull_exhaustion_price:.1f}", "#E040FB", "-.", 1.6, 10.5),
-    ]
-
-    used_positions = []
-    for price_val, lbl, col, ls, lw, x_pos in levels_raw:
-        if y_min <= price_val <= y_max:
-            ax_k.axhline(price_val, color=col, linestyle=ls, linewidth=lw, alpha=0.88, zorder=2)
-            adj_x = x_pos
-            for up_val, up_x in used_positions:
-                if abs(price_val - up_val) < (y_max - y_min) * 0.035 and abs(adj_x - up_x) < 8.0:
-                    adj_x = up_x + 11.5
-            used_positions.append((price_val, adj_x))
-            ax_k.text(
-                adj_x,
-                price_val + (y_max - y_min) * 0.006,
-                lbl,
-                color=col,
-                fontsize=9.2,
-                fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="#0E1117", edgecolor="none", alpha=0.82),
-                zorder=5,
-            )
-
-    if snap.active_alerts:
-        last_x = len(df_plot) - 1
-        badge_text = "\n".join([a.chart_badge for a in snap.active_alerts])
-        box_y = (
-            snap.spot_price - (y_max - y_min) * 0.14
-            if snap.spot_price > (y_min + y_max) * 0.55
-            else snap.spot_price + (y_max - y_min) * 0.12
-        )
-        ax_k.annotate(
-            badge_text,
-            xy=(last_x, snap.spot_price),
-            xytext=(max(16, last_x - 20), box_y),
-            arrowprops=dict(facecolor="#FFD600", shrink=0.06, width=2, headwidth=7),
-            fontsize=10,
-            fontweight="bold",
-            color="#FFFFFF",
-            bbox=dict(boxstyle="round,pad=0.45", facecolor="#B71C1C", edgecolor="#FFD600", lw=1.5),
-            zorder=8,
-        )
-
-    regime_title = (
-        "【正 Gamma 狀態：區間高拋低吸】"
-        if snap.is_positive_gamma
-        else "【負 Gamma 狀態：造市商追高殺低 / 擠壓警戒】"
+    # 繪製關鍵期權水平線，並做垂直防重疊偏移 (Anti-Overlap Vertical Solver)
+    cw_label = (
+        f"主力 Call 牆(已突破轉撐) ${snap.call_wall:.1f}"
+        if snap.call_wall < snap.spot_price
+        else f"主力 Call 壓力牆 ${snap.call_wall:.1f}"
     )
+    pw_label = (
+        f"主力 Put 牆(已跌破轉壓) ${snap.put_wall:.1f}"
+        if snap.put_wall > snap.spot_price
+        else f"主力 Put 支撐牆 ${snap.put_wall:.1f}"
+    )
+    levels_raw = [
+        (snap.bull_exhaustion_price, f"衰竭天花板 ${snap.bull_exhaustion_price:.1f}", "#E040FB", "-.", 1.6),
+        (snap.call_wall, cw_label, "#FF5252", "-", 2.0),
+        (snap.bull_squeeze_trigger, f"軋空啟動 ${snap.bull_squeeze_trigger:.1f}", "#FF9100", "-.", 1.8),
+        (snap.max_pain, f"Max Pain 痛點 ${snap.max_pain:.1f}", "#40C4FF", ":", 1.8),
+        (snap.zero_gamma_flip, f"Zero Gamma 翻轉 ${snap.zero_gamma_flip:.2f}", "#FFD600", "--", 2.0),
+        (snap.put_wall, pw_label, "#00E676", "-", 2.0),
+    ]
+    if snap.call_wall < snap.spot_price and snap.next_upper_call_wall > snap.spot_price:
+        levels_raw.append((snap.next_upper_call_wall, f"上方次級 Call 牆 ${snap.next_upper_call_wall:.1f}", "#FF8A80", "--", 1.5))
+    if snap.put_wall > snap.spot_price and snap.next_lower_put_wall < snap.spot_price:
+        levels_raw.append((snap.next_lower_put_wall, f"下方次級 Put 牆 ${snap.next_lower_put_wall:.1f}", "#69F0AE", "--", 1.5))
+    # 合併相同價位之標籤，避免兩條同價位線字體重疊
+    merged_levels: List[Tuple[float, str, str, str, float]] = []
+    for price_val, lbl, col, ls, lw in sorted(levels_raw, key=lambda x: x[0], reverse=True):
+        if not (y_min <= price_val <= y_max):
+            continue
+        if merged_levels and abs(price_val - merged_levels[-1][0]) < (y_max - y_min) * 0.008:
+            prev_p, prev_lbl, prev_col, prev_ls, prev_lw = merged_levels[-1]
+            short_new = lbl.split("$")[0].strip()
+            merged_levels[-1] = (prev_p, f"{prev_lbl} / {short_new}", prev_col, prev_ls, prev_lw)
+        else:
+            merged_levels.append((price_val, lbl, col, ls, lw))
+
+    min_gap_y = (y_max - y_min) * 0.042
+    placed_y: List[float] = []
+    for idx_l, (price_val, lbl, col, ls, lw) in enumerate(merged_levels):
+        ax_k.axhline(price_val, color=col, linestyle=ls, linewidth=lw, alpha=0.88, zorder=2)
+        target_y = price_val
+        for py in placed_y:
+            if abs(target_y - py) < min_gap_y:
+                target_y = py - min_gap_y
+        target_y = max(y_min + min_gap_y * 0.4, min(y_max - min_gap_y * 0.4, target_y))
+        placed_y.append(target_y)
+        x_anchor = 7.5 if (idx_l % 2 == 0) else 20.0
+        ax_k.text(
+            x_anchor,
+            target_y,
+            lbl,
+            color=col,
+            fontsize=9.2,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#0E1117", edgecolor=col, lw=0.8, alpha=0.90),
+            zorder=7,
+        )
+
+    # X 軸真實日期刻度
+    tick_positions = list(range(0, len(df_plot), max(1, len(df_plot) // 7)))
+    if (len(df_plot) - 1) not in tick_positions:
+        tick_positions.append(len(df_plot) - 1)
+    ax_k.set_xticks(tick_positions)
+    ax_k.set_xticklabels([date_labels[p] for p in tick_positions], color="#B2B5BE", fontsize=9)
+
+    chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
+    regime_title = "【正 Gamma 穩定區】" if snap.is_positive_gamma else "【負 Gamma 擠壓警戒區】"
     ax_k.set_title(
-        f"{snap.ticker} 期權籌碼雷達 K 線圖 (現價 ${snap.spot_price:.2f}) — {regime_title}",
+        f"{snap.ticker} 日 K 線圖 (現價 ${snap.spot_price:.2f} / {chg_pct:+.2f}% / 昨收 ${snap.prev_close:.2f}) — {regime_title}",
         color="white",
-        fontsize=12.5,
+        fontsize=12.2,
         fontweight="bold",
         pad=10,
     )
+    ax_k.legend(loc="upper left", facecolor="#131722", edgecolor="#2A2E39", labelcolor="white", fontsize=8.5)
     ax_k.set_ylim(y_min, y_max)
-    ax_k.set_xlim(-1, len(df_plot) + 2)
+    ax_k.set_xlim(-1, len(df_plot) + 1.5)
     ax_k.grid(True, color="#2A2E39", linestyle="--", linewidth=0.6, alpha=0.6)
     ax_k.tick_params(colors="#B2B5BE", labelsize=9)
 
     df_sub = df_chain[(df_chain["strike"] >= y_min) & (df_chain["strike"] <= y_max)]
     bar_height = (
-        max(np.min(np.diff(df_sub["strike"].values)) * 0.65, 1.2)
+        max(np.min(np.diff(df_sub["strike"].values)) * 0.65, 0.8)
         if len(df_sub) > 1
-        else 2.0
+        else 1.5
     )
-    colors_gex = [
-        "#00E676" if v >= 0 else "#FF1744" for v in df_sub["net_gex_m"].values
-    ]
+    colors_gex = ["#00E676" if v >= 0 else "#FF1744" for v in df_sub["net_gex_m"].values]
     ax_gex.barh(
         df_sub["strike"].values,
         df_sub["net_gex_m"].values,
@@ -994,159 +1167,234 @@ def render_warroom_chart_png(
 
     ax_card.axis("off")
     status_str = (
-        f"[正 Gamma 穩定態] 現價 ${snap.spot_price:.2f} | 翻轉點 ${snap.zero_gamma_flip:.2f} | Net GEX {snap.net_gex_millions:+.1f}M"
+        f"[正 Gamma 穩定態] 現價 ${snap.spot_price:.2f} (昨收 ${snap.prev_close:.2f}) | 翻轉點 ${snap.zero_gamma_flip:.2f} | Net GEX {snap.net_gex_millions:+.1f}M"
         if snap.is_positive_gamma
-        else f"[負 Gamma 擠壓態] 現價 ${snap.spot_price:.2f} | 翻轉點 ${snap.zero_gamma_flip:.2f} | Net GEX {snap.net_gex_millions:+.1f}M"
+        else f"[負 Gamma 擠壓態] 現價 ${snap.spot_price:.2f} (昨收 ${snap.prev_close:.2f}) | 翻轉點 ${snap.zero_gamma_flip:.2f} | Net GEX {snap.net_gex_millions:+.1f}M"
     )
-    line1 = (
-        f"標的: {snap.ticker}  |  到期日: {snap.expiration_date} ({snap.dte_days} DTE)  |  "
-        f"時間: {snap.timestamp_tw}  |  {status_str}"
-    )
-    line2 = (
-        f"[正 Gamma 導航] 上方 Call 壓力牆: ${snap.call_wall:.2f}  |  "
-        f"下方 Put 支撐牆: ${snap.put_wall:.2f}  |  Max Pain 最大痛點: ${snap.max_pain:.2f}"
-    )
+    line1 = f"標的: {snap.ticker} (日K) | 期權範圍: {snap.expiration_date} | 時間: {snap.timestamp_tw}"
+    line2 = f"• {status_str} | 下方 Put 支撐牆: ${snap.put_wall:.2f} | Max Pain 痛點: ${snap.max_pain:.2f} | 上方 Call 壓力牆: ${snap.call_wall:.2f}"
     line3 = (
-        f"[負 Gamma 導航] Squeeze 向上啟動價: ${snap.bull_squeeze_trigger:.2f} (向下破牆價: ${snap.bear_squeeze_trigger:.2f})  |  "
-        f"衰竭天花板: ${snap.bull_exhaustion_price:.2f}  |  ATM IV: {snap.atm_iv_pct:.1f}% (峰值 {snap.iv_peak_pct:.1f}%, 回落 {snap.iv_drop_from_peak_pct:.1f}%)"
+        f"• [Squeeze 雷達] 向上軋空啟動: ${snap.bull_squeeze_trigger:.2f} (衰竭目標: ${snap.bull_exhaustion_price:.2f}) | "
+        f"向下破牆助跌: ${snap.bear_squeeze_trigger:.2f} | ATM IV: {snap.atm_iv_pct:.1f}% (峰值 {snap.iv_peak_pct:.1f}%)"
     )
-
     if snap.active_alerts:
-        top_alert = snap.active_alerts[0]
-        line4 = (
-            f"[即時觸發推播訊號] {top_alert.chart_badge} -> 建議進場 Entry: ${top_alert.entry_price:.2f} | "
-            f"停損 SL: ${top_alert.sl_price:.2f} | 停利 TP: ${top_alert.tp_price:.2f} (風報比 RRR 1:{top_alert.rrr:.1f})"
-        )
-        line4_col = "#FFD600"
+        a0 = snap.active_alerts[0]
+        line4 = f"🚨 {a0.title} — 建議進場 ${a0.entry_price:.2f} | 停損 ${a0.sl_price:.2f} | 停利 ${a0.tp_price:.2f} (RRR 1:{a0.rrr:.1f})"
+        c4 = "#FFD600"
     else:
-        line4 = (
-            f"[正常監控中] Charm 尾盤平倉警戒時間窗: {snap.charm_unwind_time_tw} "
-            f"(隱含波動區間 +/-${snap.expected_move_usd:.2f} / +/-{snap.expected_move_pct:.1f}%)"
-        )
-        line4_col = "#80D8FF"
+        line4 = f"• [Charm 平倉警戒窗] {snap.charm_unwind_time_tw} | 預期波動區間: +/-${snap.expected_move_usd:.2f} (+/-{snap.expected_move_pct:.1f}%)"
+        c4 = "#80D8FF"
 
-    ax_card.text(0.015, 0.78, line1, color="#FFFFFF", fontsize=10.5, fontweight="bold")
-    ax_card.text(0.015, 0.54, line2, color="#00E676", fontsize=10)
-    ax_card.text(0.015, 0.30, line3, color="#FF9100", fontsize=10)
-    ax_card.text(0.015, 0.06, line4, color=line4_col, fontsize=10.5, fontweight="bold")
+    ax_card.text(0.015, 0.78, line1, color="#FFFFFF", fontsize=10.5, fontweight="bold", transform=ax_card.transAxes)
+    ax_card.text(0.015, 0.54, line2, color="#00E676" if snap.is_positive_gamma else "#FF8A80", fontsize=10, transform=ax_card.transAxes)
+    ax_card.text(0.015, 0.30, line3, color="#FFB74D", fontsize=10, transform=ax_card.transAxes)
+    ax_card.text(0.015, 0.07, line4, color=c4, fontsize=10, fontweight="bold", transform=ax_card.transAxes)
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     plt.savefig(output_path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return output_path
 
 
 # ============================================================================
-# 4. Telegram 自動推播與開盤前早報格式化引擎
+# 4. Telegram 推播與清爽三行式早報 / 納斯達克前十大總體方向研判
 # ============================================================================
 def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
-    regime_str = (
-        "🟢 正 Gamma (高拋低吸 / 區間收斂)"
-        if snap.is_positive_gamma
-        else "🔴 負 Gamma (追高殺低 / 擠壓放大)"
-    )
+    chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
+    regime_emoji = "🟢 正 Gamma (高拋低吸 / 區間收斂)" if snap.is_positive_gamma else "🔴 負 Gamma (追高殺低 / 擠壓爆發)"
     lines = [
-        f"📡 *【美股期權 GEX 與 Gamma Squeeze 戰情警報】*",
-        f"• *標的代號*: `{snap.ticker}` ([Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker}))",
-        f"• *分析時間*: `{snap.timestamp_tw}`",
-        f"• *目標到期日*: `{snap.expiration_date}` (`{snap.dte_days} DTE`)",
-        f"• *目前現價*: `${snap.spot_price:.2f}` (前收 `${snap.prev_close:.2f}`)",
-        f"• *期權體制*: {regime_str}",
-        f"• *全市場 Net GEX*: `{snap.net_gex_millions:+.2f}M`",
-        f"• *Zero Gamma 翻轉點*: `${snap.zero_gamma_flip:.2f}`",
+        f"📡 *【{snap.ticker} 期權 GEX 日K戰情卡】*",
+        f"• 分析時間：`{snap.timestamp_tw}`",
+        f"• 期權樣本：`{snap.expiration_date}`",
+        f"• 最新日K：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`) [Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
+        f"• 期權體制：{regime_emoji}",
+        f"• 總淨曝險：`{snap.net_gex_millions:+.2f}M`｜翻轉點：`${snap.zero_gamma_flip:.2f}`",
         "",
-        f"🏛️ *【支撐壓力牆與 Max Pain】*",
-        f"• *上方 Call 壓力牆*: `${snap.call_wall:.2f}`",
-        f"• *下方 Put 支撐牆*: `${snap.put_wall:.2f}`",
-        f"• *Max Pain 最大痛點*: `${snap.max_pain:.2f}`",
+        "🏛️ *【全場主力支撐壓力牆與破牆狀態】*",
+        (
+            f"• 主力 Call 牆：`${snap.call_wall:.2f}` 🚀 *(現價已突破轉下方支撐！上方次級 Call 牆 `${snap.next_upper_call_wall:.2f}`)*"
+            if snap.call_wall < snap.spot_price
+            else f"• 主力 Call 壓力牆：`${snap.call_wall:.2f}`"
+        ),
+        f"• Max Pain 最大痛點：`${snap.max_pain:.2f}`",
+        (
+            f"• 主力 Put 牆：`${snap.put_wall:.2f}` ⚠️ *(現價已跌破轉上方反壓！下方次級 Put 牆 `${snap.next_lower_put_wall:.2f}`)*"
+            if snap.put_wall > snap.spot_price
+            else f"• 主力 Put 支撐牆：`${snap.put_wall:.2f}`"
+        ),
         "",
-        f"⚡ *【Gamma Squeeze 啟動與衰竭雷達】*",
-        f"• *向上軋空啟動價*: `${snap.bull_squeeze_trigger:.2f}`",
-        f"• *向下破牆啟動價*: `${snap.bear_squeeze_trigger:.2f}`",
-        f"• *向上衰竭目標價*: `${snap.bull_exhaustion_price:.2f}`",
-        f"• *ATM IV 狀態*: `{snap.atm_iv_pct:.1f}%` (盤中峰值 `{snap.iv_peak_pct:.1f}%`, 回落 `{snap.iv_drop_from_peak_pct:.1f}%`)",
-        f"• *Charm 尾盤平倉窗*: `{snap.charm_unwind_time_tw}`",
+        "⚡ *【Gamma Squeeze 啟動與衰竭雷達】*",
+        f"• 向上軋空啟動：`${snap.bull_squeeze_trigger:.2f}` ➔ 衰竭目標 `${snap.bull_exhaustion_price:.2f}`",
+        f"• 向下破牆助跌：`${snap.bear_squeeze_trigger:.2f}` ➔ 空頭目標 `${snap.bear_exhaustion_price:.2f}`",
+        f"• ATM IV 狀態：`{snap.atm_iv_pct:.1f}%` (峰值 `{snap.iv_peak_pct:.1f}%` / 回落 `{snap.iv_drop_from_peak_pct:.1f}%`)",
+        f"• Charm 平倉窗：`{snap.charm_unwind_time_tw}`",
     ]
-
     if snap.active_alerts:
         lines.append("")
-        lines.append("🚨 *【觸發實戰推播事件與 RRR >= 1:2 交易計畫】*")
-        for idx, al in enumerate(snap.active_alerts, 1):
+        for a in snap.active_alerts:
             lines.extend(
                 [
-                    f"*{idx}. {al.title}*",
-                    f"   • 說明: {al.description}",
-                    f"   • 對策: {al.action_plan}",
-                    f"   • 進場點 (Entry): `${al.entry_price:.2f}`",
-                    f"   • 停損點 (SL): `${al.sl_price:.2f}`",
-                    f"   • 停利點 (TP): `${al.tp_price:.2f}` (預期風報比 `1:{al.rrr:.1f}`)",
+                    f"🚨 *{a.title}*",
+                    f"• 診斷：{a.description}",
+                    f"• 策略：{a.action_plan}",
+                    f"• 點位：進場 `${a.entry_price:.2f}`｜停損 `${a.sl_price:.2f}`｜停利 `${a.tp_price:.2f}` (`RRR 1:{a.rrr:.1f}`)",
                 ]
             )
     return "\n".join(lines)
 
 
-def format_single_line_brief(snap: WarRoomSnapshot) -> str:
+def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> Dict:
     """
-    將單一標的格式化為早報專屬之完整垂直卡片列：
-    不論 SPY、QQQ 或 12 檔核心自選股，皆完整列出正負 Gamma、翻轉點、Call牆、Put牆、Max Pain，
-    若為負 Gamma 額外標示 Squeeze 啟動價、衰竭目標價與 IV 警戒線。
+    根據 QQQ 與納斯達克前十大權重股 (AAPL, NVDA, MSFT, AMZN, AVGO, META, TSLA, GOOGL, COST, NFLX)
+    之正負 Gamma 家數、淨 GEX 總和與價格相對翻轉點位置，給出整體納斯達克市場狀況與方向研判。
     """
-    if snap.is_positive_gamma:
-        return (
-            f"• *{snap.ticker}* (`${snap.spot_price:.2f}`)：🟢 *正 Gamma* (`{snap.net_gex_millions:+.1f}M`)\n"
-            f"  └ 翻轉點 `${snap.zero_gamma_flip:.2f}` | Call牆 `${snap.call_wall:.2f}` / Put牆 `${snap.put_wall:.2f}` | "
-            f"Max Pain `${snap.max_pain:.2f}` | 預期波動 `±${snap.expected_move_usd:.2f}` (`±{snap.expected_move_pct:.1f}%`)"
+    ndx_snaps = [scanned_map[tk] for tk in NASDAQ_TOP10_TICKERS if tk in scanned_map]
+    qqq_snap = scanned_map.get("QQQ")
+
+    pos_list = [s.ticker for s in ndx_snaps if s.is_positive_gamma]
+    neg_list = [s.ticker for s in ndx_snaps if not s.is_positive_gamma]
+    pos_count = len(pos_list)
+    neg_count = len(neg_list)
+    total_ndx_gex = sum(s.net_gex_millions for s in ndx_snaps)
+    above_flip_count = sum(1 for s in ndx_snaps if s.spot_price >= s.zero_gamma_flip)
+
+    qqq_pos = qqq_snap.is_positive_gamma if qqq_snap else (pos_count >= 5)
+    qqq_gex = qqq_snap.net_gex_millions if qqq_snap else total_ndx_gex
+
+    if qqq_pos and pos_count >= 6:
+        overall_badge = "🟢 納指整體偏多穩健（正 Gamma 護盤主導）"
+        direction_summary = (
+            f"前十大權重股有 {pos_count}/10 檔處於正 Gamma（合計 Net GEX {total_ndx_gex:+.1f}M），"
+            f"且 QQQ 大盤站穩翻轉點之上。造市商處於「逢低買進護盤、逢高調節」的減震體制，"
+            f"急跌至 Put 支撐牆易有強勁買盤承接，整體方向偏多震盪墊高，適合拉回支撐牆做多或賣方收租。"
+        )
+    elif (not qqq_pos) and neg_count >= 6:
+        overall_badge = "🔴 納指高波動單邊警戒（負 Gamma 助漲助跌主導）"
+        direction_summary = (
+            f"前十大權重股有 {neg_count}/10 檔落入負 Gamma（合計 Net GEX {total_ndx_gex:+.1f}M），"
+            f"且 QQQ 處於負 Gamma 區！造市商被迫「追高買進、殺低拋售」順勢放大波動，"
+            f"嚴禁在跌破 Put 牆時逆勢接刀；若帶量突破軋空啟動價則順勢追多，留意雙向劇烈洗盤。"
         )
     else:
-        iv_crush_line = round(snap.atm_iv_pct * 0.94, 1)
-        return (
-            f"• *{snap.ticker}* (`${snap.spot_price:.2f}`)：🔴 *負 Gamma* (`{snap.net_gex_millions:+.1f}M`)\n"
-            f"  └ 翻轉點 `${snap.zero_gamma_flip:.2f}` | Call牆 `${snap.call_wall:.2f}` / Put牆 `${snap.put_wall:.2f}` | Max Pain `${snap.max_pain:.2f}`\n"
-            f"  └ 🚀 軋空啟動 `${snap.bull_squeeze_trigger:.2f}` (衰竭目標 `${snap.bull_exhaustion_price:.2f}`) | "
-            f"🩸 破牆助跌 `${snap.bear_squeeze_trigger:.2f}` | ATM IV `{snap.atm_iv_pct:.1f}%` (回落警戒 `<{iv_crush_line:.1f}%`)"
+        overall_badge = "🟡 納指權重股多空分歧（結構性輪動震盪盤）"
+        direction_summary = (
+            f"前十大權重股正 Gamma 有 {pos_count} 檔（{', '.join(pos_list) or '無'}）、"
+            f"負 Gamma 有 {neg_count} 檔（{', '.join(neg_list) or '無'}），合計 Net GEX {total_ndx_gex:+.1f}M。"
+            f"指數空間受限於權重股正負力道抵銷，操作上應避開負 Gamma 破底弱勢股，集中資金操作正 Gamma 護盤股。"
         )
+
+    return {
+        "pos_count": pos_count,
+        "neg_count": neg_count,
+        "pos_list": pos_list,
+        "neg_list": neg_list,
+        "total_ndx_gex": round(total_ndx_gex, 1),
+        "above_flip_count": above_flip_count,
+        "qqq_gex": round(qqq_gex, 1),
+        "overall_badge": overall_badge,
+        "direction_summary": direction_summary,
+    }
+
+
+def format_clean_3line_stock_brief(s: WarRoomSnapshot) -> str:
+    """
+    清爽易讀的三行式早報卡片（每檔股票之間留空行，手機一眼看懂）
+    """
+    chg_pct = ((s.spot_price - s.prev_close) / max(s.prev_close, 0.01)) * 100.0
+    light = "🟢 正Gamma" if s.is_positive_gamma else "🔴 負Gamma"
+    line1 = f"*{s.ticker}* (`${s.spot_price:.2f}` / `{chg_pct:+.2f}%`)｜{light} (`{s.net_gex_millions:+.1f}M`)"
+    pw_tag = f"${s.put_wall:.1f}(⚠️已跌破轉壓/次撐${s.next_lower_put_wall:.1f})" if s.put_wall > s.spot_price else f"${s.put_wall:.1f}"
+    cw_tag = f"${s.call_wall:.1f}(🚀已突破轉撐/次壓${s.next_upper_call_wall:.1f})" if s.call_wall < s.spot_price else f"${s.call_wall:.1f}"
+    line2 = f"  • 籌碼牆：Put牆 `{pw_tag}` ｜ 痛點 `${s.max_pain:.1f}` ｜ Call牆 `{cw_tag}`" 
+    if s.is_positive_gamma:
+        line3 = f"  • 轉折：翻轉點 `${s.zero_gamma_flip:.2f}`｜預期波動 `±${s.expected_move_usd:.1f}` (`±{s.expected_move_pct:.1f}%`)"
+    else:
+        line3 = (
+            f"  • 擠壓：突破 `${s.bull_squeeze_trigger:.1f}` 軋空 (目標 `${s.bull_exhaustion_price:.1f}`)｜"
+            f"跌破 `${s.bear_squeeze_trigger:.1f}` 助跌"
+        )
+    return f"{line1}\n{line2}\n{line3}"
+
+
+def send_telegram_alert_with_detail(
+    bot_token: str,
+    chat_id: str,
+    message_md: str,
+    image_path: Optional[str] = None,
+) -> Tuple[bool, str]:
+    clean_tok, clean_cid = sanitize_tg_credentials(bot_token, chat_id)
+    if not clean_tok or not clean_cid:
+        return False, "Bot Token 或 Chat ID 為空"
+
+    import requests
+
+    def _post_tg(url: str, data_dict: Dict, files_dict: Optional[Dict] = None) -> requests.Response:
+        try:
+            return requests.post(url, data=data_dict, files=files_dict, timeout=20, verify=True)
+        except requests.exceptions.SSLError:
+            return requests.post(url, data=data_dict, files=files_dict, timeout=20, verify=False)
+
+    try:
+        if image_path and os.path.exists(image_path):
+            url_photo = f"https://api.telegram.org/bot{clean_tok}/sendPhoto"
+            short_cap = (
+                f"📊 {os.path.basename(image_path)} — 完整期權 GEX 日K點位請見下方戰情卡"
+                if len(message_md) > 900
+                else message_md
+            )
+            with open(image_path, "rb") as img_f:
+                r_img = _post_tg(
+                    url_photo,
+                    {"chat_id": clean_cid, "caption": short_cap},
+                    {"photo": img_f},
+                )
+            if r_img.status_code != 200:
+                return False, f"sendPhoto HTTP {r_img.status_code}: {r_img.text[:160]}"
+            if len(message_md) <= 900:
+                return True, "圖文單則推播成功"
+
+        url_msg = f"https://api.telegram.org/bot{clean_tok}/sendMessage"
+        r_txt = _post_tg(
+            url_msg,
+            {
+                "chat_id": clean_cid,
+                "text": message_md,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": "true",
+            },
+        )
+        if r_txt.status_code == 200:
+            return True, "推播成功"
+
+        plain_text = message_md.replace("*", "").replace("`", "")
+        r_plain = _post_tg(
+            url_msg,
+            {
+                "chat_id": clean_cid,
+                "text": plain_text,
+                "disable_web_page_preview": "true",
+            },
+        )
+        if r_plain.status_code == 200:
+            return True, "推播成功 (純文字模式)"
+        return False, f"HTTP {r_plain.status_code}: {r_plain.text[:180]}"
+    except Exception as exc:
+        return False, f"網路連線異常: {exc}"
 
 
 def send_telegram_alert(
-    bot_token: str, chat_id: str, message_md: str, image_path: Optional[str] = None
+    bot_token: str,
+    chat_id: str,
+    message_md: str,
+    image_path: Optional[str] = None,
 ) -> bool:
-    if not bot_token or not chat_id:
-        return False
-
-    try:
-        url_msg = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = urllib.parse.urlencode(
-            {"chat_id": chat_id, "text": message_md, "parse_mode": "Markdown"}
-        ).encode("utf-8")
-        req = urllib.request.Request(url_msg, data=payload, method="POST")
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            _ = resp.read()
-
-        if image_path and os.path.exists(image_path):
-            import requests
-
-            url_photo = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-            with open(image_path, "rb") as img_f:
-                requests.post(
-                    url_photo,
-                    data={"chat_id": chat_id, "caption": f"📊 {os.path.basename(image_path)}"},
-                    files={"photo": img_f},
-                    timeout=15,
-                )
-        return True
-    except Exception as exc:
-        print(f"[Telegram 推播失敗]: {exc}")
-        return False
+    ok, _ = send_telegram_alert_with_detail(bot_token, chat_id, message_md, image_path)
+    return ok
 
 
 # ============================================================================
-# 5. 全美股多執行緒期權鏈批次掃描器 (含無期權標的之現貨波動率智慧回退機制)
+# 5. 全美股多執行緒期權鏈批次掃描器 (改為抓取標準日K線 1d + 近4期期權聚合)
 # ============================================================================
 def build_spot_proxy_chain(spot: float, df_ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, str, float]:
-    """
-    當特定標的 (例如剛上市或特殊太空 ETF 如 SPCX) 暫無期權鏈報價時，
-    利用近 20 日歷史波動率 (HV) 與價格區間自動建構等效合成期權鏈，確保 12 檔核心自選股 100% 不漏檔。
-    """
     log_ret = np.log(df_ohlcv["Close"] / df_ohlcv["Close"].shift(1)).dropna()
     hv = float(log_ret.std() * np.sqrt(252)) if len(log_ret) >= 5 else 0.45
     hv = float(np.clip(hv, 0.18, 1.50))
@@ -1183,8 +1431,12 @@ def build_spot_proxy_chain(spot: float, df_ohlcv: pd.DataFrame) -> Tuple[pd.Data
 
 
 def fetch_live_market_data(
-    ticker: str, exp_index: int = 0, interval: str = "15m", period: str = "5d"
+    ticker: str, exp_index: int = 0, interval: str = "1d", period: str = "3mo"
 ) -> Tuple[str, pd.DataFrame, pd.DataFrame, str, float]:
+    """
+    預設抓取近 3 個月之標準「日 K 線 (interval='1d', period='3mo')」，
+    確保 K 線形態、最高最低價、昨收價與富途牛牛 / TradingView 的日線圖 100% 一致！
+    """
     import yfinance as yf
 
     tk = yf.Ticker(ticker)
@@ -1192,7 +1444,7 @@ def fetch_live_market_data(
     if df_ohlcv.empty:
         df_ohlcv = tk.history(period="1mo", interval="1d")
     if df_ohlcv.empty:
-        raise RuntimeError(f"無法取得 {ticker} K 線數據。")
+        raise RuntimeError(f"無法取得 {ticker} 日 K 線數據。")
 
     spot = float(df_ohlcv["Close"].iloc[-1])
     exps = tk.options
@@ -1200,26 +1452,97 @@ def fetch_live_market_data(
         df_proxy, exp_str, dte_val = build_spot_proxy_chain(spot, df_ohlcv)
         return ticker.upper(), df_ohlcv, df_proxy, exp_str, dte_val
 
-    chosen_exp = exps[min(exp_index, len(exps) - 1)]
-    opt = tk.option_chain(chosen_exp)
-    calls = opt.calls[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
-        columns={"openInterest": "call_oi", "volume": "call_vol", "impliedVolatility": "call_iv"}
-    )
-    puts = opt.puts[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
-        columns={"openInterest": "put_oi", "volume": "put_vol", "impliedVolatility": "put_iv"}
-    )
-    df_chain = pd.merge(calls, puts, on="strike", how="outer").fillna(0.0)
-    df_chain = df_chain[
-        (df_chain["strike"] >= spot * 0.78) & (df_chain["strike"] <= spot * 1.22)
-    ].reset_index(drop=True)
-    if df_chain.empty:
+    today_dt = datetime.datetime.now(datetime.timezone.utc).date()
+    if exp_index == 0:
+        # 統一對齊「未來 14 天內 (涵蓋本週五與下週五 OPEX)」的所有近月/週選合約；
+        # 解決 SPY/QQQ 因每日到期導致前 4 期漏掉本週五主力 OPEX 的問題（最少取 2 期、最多 10 期兼顧速度）
+        within_14d = []
+        for e_s in exps:
+            try:
+                e_dt = datetime.datetime.strptime(e_s, "%Y-%m-%d").date()
+                if (e_dt - today_dt).days <= 14:
+                    within_14d.append(e_s)
+            except Exception:
+                continue
+        if len(within_14d) < 2:
+            selected_exps = list(exps[: min(2, len(exps))])
+        else:
+            selected_exps = within_14d[:10]
+    else:
+        selected_exps = [exps[min(exp_index, len(exps) - 1)]]
+
+    agg_frames = []
+    exp_oi_totals = {}
+    valid_exps = []
+
+    for exp_str in selected_exps:
+        try:
+            opt = tk.option_chain(exp_str)
+            calls = opt.calls[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
+                columns={"openInterest": "call_oi", "volume": "call_vol", "impliedVolatility": "call_iv"}
+            )
+            puts = opt.puts[["strike", "openInterest", "volume", "impliedVolatility"]].rename(
+                columns={"openInterest": "put_oi", "volume": "put_vol", "impliedVolatility": "put_iv"}
+            )
+            df_e = pd.merge(calls, puts, on="strike", how="outer").fillna(0.0)
+            df_e = df_e[
+                (df_e["strike"] >= spot * 0.78) & (df_e["strike"] <= spot * 1.22)
+            ].copy()
+            if df_e.empty:
+                continue
+            exp_d_obj = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+            dte_e = max(float((exp_d_obj - today_dt).days), 0.5)
+            tte_e = max(dte_e / 365.0, 1.0 / (365.0 * 24.0))
+            _, _, c_gam_e, _, _ = bs_greeks(
+                spot, df_e["strike"].values, tte_e, df_e["call_iv"].values
+            )
+            _, _, p_gam_e, _, _ = bs_greeks(
+                spot, df_e["strike"].values, tte_e, df_e["put_iv"].values
+            )
+            # 先依各到期日真實剩餘天數 T_m 與 IV 算出各期真實 Dollar GEX，再跨期加總
+            df_e["pre_call_gex_m"] = (df_e["call_oi"].values * c_gam_e * 100.0 * (spot**2) * 0.01) / 1e6
+            df_e["pre_put_gex_m"] = (-df_e["put_oi"].values * p_gam_e * 100.0 * (spot**2) * 0.01) / 1e6
+            df_e["call_iv_weighted"] = df_e["call_iv"] * np.maximum(df_e["call_oi"], 1.0)
+            df_e["put_iv_weighted"] = df_e["put_iv"] * np.maximum(df_e["put_oi"], 1.0)
+            agg_frames.append(df_e)
+            exp_oi_totals[exp_str] = float(
+                np.abs(df_e["pre_call_gex_m"]).sum() + np.abs(df_e["pre_put_gex_m"]).sum()
+            )
+            valid_exps.append(exp_str)
+        except Exception:
+            continue
+
+    if not agg_frames:
         df_proxy, exp_str, dte_val = build_spot_proxy_chain(spot, df_ohlcv)
         return ticker.upper(), df_ohlcv, df_proxy, exp_str, dte_val
 
-    exp_dt = datetime.datetime.strptime(chosen_exp, "%Y-%m-%d").date()
-    today_dt = datetime.datetime.now(datetime.timezone.utc).date()
-    dte_days = max(float((exp_dt - today_dt).days), 0.5)
-    return ticker.upper(), df_ohlcv, df_chain, chosen_exp, dte_days
+    df_concat = pd.concat(agg_frames, ignore_index=True)
+    grouped = df_concat.groupby("strike", as_index=False).agg(
+        call_oi=("call_oi", "sum"),
+        put_oi=("put_oi", "sum"),
+        call_vol=("call_vol", "sum"),
+        put_vol=("put_vol", "sum"),
+        call_iv_w=("call_iv_weighted", "sum"),
+        put_iv_w=("put_iv_weighted", "sum"),
+        pre_call_gex_m=("pre_call_gex_m", "sum"),
+        pre_put_gex_m=("pre_put_gex_m", "sum"),
+    )
+    grouped["call_iv"] = grouped["call_iv_w"] / np.maximum(grouped["call_oi"], 1.0)
+    grouped["put_iv"] = grouped["put_iv_w"] / np.maximum(grouped["put_oi"], 1.0)
+    df_chain = grouped[
+        ["strike", "call_oi", "put_oi", "call_vol", "put_vol", "call_iv", "put_iv", "pre_call_gex_m", "pre_put_gex_m"]
+    ].reset_index(drop=True)
+
+    dominant_exp = max(exp_oi_totals.items(), key=lambda x: x[1])[0]
+    dom_dt = datetime.datetime.strptime(dominant_exp, "%Y-%m-%d").date()
+    dte_days = max(float((dom_dt - today_dt).days), 0.5)
+
+    if len(valid_exps) > 1:
+        exp_label = f"{dominant_exp} (主力OI，聚合 {valid_exps[0]}~{valid_exps[-1]} 共{len(valid_exps)}期)"
+    else:
+        exp_label = valid_exps[0]
+
+    return ticker.upper(), df_ohlcv, df_chain, exp_label, dte_days
 
 
 def scan_single_ticker_worker(
@@ -1227,7 +1550,7 @@ def scan_single_ticker_worker(
 ) -> Optional[Tuple[WarRoomSnapshot, pd.DataFrame, pd.DataFrame]]:
     try:
         tk, df_ohlcv, df_chain, exp_d, dte = fetch_live_market_data(
-            ticker, exp_index=exp_index, interval="15m", period="5d"
+            ticker, exp_index=exp_index, interval="1d", period="3mo"
         )
         snap, df_gex = evaluate_snapshot_and_alerts(
             tk, df_ohlcv, df_chain, exp_d, dte, iv_crush_drop_threshold_pct
@@ -1235,6 +1558,26 @@ def scan_single_ticker_worker(
         return snap, df_ohlcv, df_gex
     except Exception:
         return None
+
+
+def scan_core_14_tickers_map(
+    core_tickers: List[str], iv_crush_drop_threshold_pct: float = 6.0
+) -> Dict[str, Tuple[WarRoomSnapshot, pd.DataFrame, pd.DataFrame]]:
+    target_list = list(dict.fromkeys(MARKET_INDEX_TICKERS + core_tickers + NASDAQ_TOP10_TICKERS))
+    out_map: Dict[str, Tuple[WarRoomSnapshot, pd.DataFrame, pd.DataFrame]] = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        fut_map = {
+            executor.submit(
+                scan_single_ticker_worker, tk, 0, iv_crush_drop_threshold_pct
+            ): tk
+            for tk in target_list
+        }
+        for fut in as_completed(fut_map):
+            tk_k = fut_map[fut]
+            res = fut.result()
+            if res is not None:
+                out_map[tk_k] = res
+    return out_map
 
 
 def scan_us_market_universe(
@@ -1284,84 +1627,57 @@ def scan_us_market_universe(
 def generate_morning_briefing_report(
     core_tickers: List[str], iv_crush_drop_threshold_pct: float = 6.0
 ) -> str:
-    """
-    生成每日美股開盤前 15 分鐘完整 GEX 籌碼戰情早報：
-    1. 大盤雙指標定調 (SPY & QQQ 均完整列出 Call牆、Put牆、Max Pain、Zero Gamma、Expected Move)
-    2. 12 檔核心自選股 (NVDA, TSLA, LUNR, SPCX + 納指前十大) 完整作戰地圖
-    3. 全美股「臨門一腳」蓄勢名單 (距離 Squeeze 啟動價或 Put 支撐牆 <= 1.5%)
-    4. 結算日 DTE 與 Charm 尾盤平倉時間提醒
-    """
     now_tw = (
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
 
-    target_list = list(dict.fromkeys(MARKET_INDEX_TICKERS + core_tickers))
-    scanned_map: Dict[str, WarRoomSnapshot] = {}
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        fut_map = {
-            executor.submit(
-                scan_single_ticker_worker, tk, 0, iv_crush_drop_threshold_pct
-            ): tk
-            for tk in target_list
-        }
-        for fut in as_completed(fut_map):
-            tk_key = fut_map[fut]
-            res = fut.result()
-            if res is not None:
-                scanned_map[tk_key] = res[0]
+    full_map = scan_core_14_tickers_map(core_tickers, iv_crush_drop_threshold_pct)
+    scanned_map: Dict[str, WarRoomSnapshot] = {k: v[0] for k, v in full_map.items()}
+    ndx_diag = analyze_nasdaq_top10_direction(scanned_map)
 
     lines = [
         "🌅 *【美股開盤前 GEX 籌碼戰情早報】*",
-        f"時間：`{now_tw}`（開盤前全自動掃描）",
+        f"時間：`{now_tw}`（近4期跨到期日主力籌碼聚合）",
         "",
-        "📊 *【一、 大盤雙指標完整定調 (SPY & QQQ)】*",
+        "🧭 *【一、 納斯達克 100 與前十大權重股總體方向】*",
+        f"• 定調：*{ndx_diag['overall_badge']}*",
+        f"• 權重結構：正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）",
+        f"• 方向研判：{ndx_diag['direction_summary']}",
+        "",
+        "📊 *【二、 大盤雙指標 (SPY & QQQ)】*",
     ]
 
     for idx_tk in MARKET_INDEX_TICKERS:
         if idx_tk in scanned_map:
-            lines.append(format_single_line_brief(scanned_map[idx_tk]))
-        else:
-            lines.append(f"• *{idx_tk}*：連線抓取中，請稍候重試")
+            lines.append(format_clean_3line_stock_brief(scanned_map[idx_tk]))
+            lines.append("")
 
-    lines.extend(["", "🎯 *【二、 核心自選股 12 檔開盤作戰地圖】*"])
+    lines.append("🎯 *【三、 核心自選股 12 檔開盤作戰地圖】*")
     for c_tk in core_tickers:
         if c_tk in scanned_map:
-            lines.append(format_single_line_brief(scanned_map[c_tk]))
+            lines.append(format_clean_3line_stock_brief(scanned_map[c_tk]))
+            lines.append("")
 
-    # 挑選臨門一腳蓄勢股 (現價距離 Bull Squeeze Trigger 或 Put Wall <= 1.8%)
     near_breakout_lines = []
     for tk_k, sn in scanned_map.items():
         if tk_k in MARKET_INDEX_TICKERS:
             continue
         dist_bull_pct = abs(sn.bull_squeeze_trigger - sn.spot_price) / max(sn.spot_price, 0.01) * 100.0
         dist_put_pct = abs(sn.spot_price - sn.put_wall) / max(sn.spot_price, 0.01) * 100.0
-        vol_ratio = sn.latest_volume / max(sn.vol_ma20, 1.0)
         if dist_bull_pct <= 1.8:
             near_breakout_lines.append(
-                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 距上方 Squeeze 啟動價 `${sn.bull_squeeze_trigger:.2f}` 僅 `{dist_bull_pct:.2f}%` (量比 `{vol_ratio:.2f}x`)"
+                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 距上方軋空啟動 `${sn.bull_squeeze_trigger:.1f}` 僅 `{dist_bull_pct:.2f}%`"
             )
         elif dist_put_pct <= 1.8:
             near_breakout_lines.append(
-                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 緊貼下方 Put 支撐牆 `${sn.put_wall:.2f}` 僅 `{dist_put_pct:.2f}%`，開盤嚴防破牆助跌"
+                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 緊貼下方 Put 牆 `${sn.put_wall:.1f}` 僅 `{dist_put_pct:.2f}%`"
             )
 
-    lines.extend(["", "🔥 *【三、 臨門一腳蓄勢重點關注】*"])
+    lines.append("🔥 *【四、 臨門一腳重點關注】*")
     if near_breakout_lines:
         lines.extend(near_breakout_lines[:5])
     else:
-        lines.append("• 目前核心自選股均位於支撐壓力牆中間區間，等待開盤量能表態。")
-
-    sample_snap = next(iter(scanned_map.values()), None)
-    if sample_snap is not None:
-        lines.extend(
-            [
-                "",
-                "⏰ *【四、 結算日與 Charm 尾盤倒貨時間窗】*",
-                f"• 目標期權到期日：`{sample_snap.expiration_date}` (尚餘 `{sample_snap.dte_days} DTE`)",
-                f"• Charm 尾盤平倉警戒窗：`{sample_snap.charm_unwind_time_tw}`",
-            ]
-        )
+        lines.append("• 目前核心自選股均位於支撐與壓力牆中間區間，等待開盤表態。")
 
     return "\n".join(lines)
 
@@ -1391,22 +1707,44 @@ class BackgroundPatrolDaemon:
         self._last_update_id: int = 0
         self._thread_patrol = threading.Thread(target=self._patrol_loop, daemon=True)
         self._thread_tg_cmd = threading.Thread(target=self._tg_command_loop, daemon=True)
+        self._thread_mt5_req = threading.Thread(target=self._mt5_request_loop, daemon=True)
         self._thread_patrol.start()
         self._thread_tg_cmd.start()
+        self._thread_mt5_req.start()
+
+    def _mt5_request_loop(self) -> None:
+        while True:
+            try:
+                req_path = os.path.join(get_mt5_common_files_dir(), "gex_mt5_request.txt")
+                if os.path.exists(req_path):
+                    with open(req_path, "r", encoding="utf-8", errors="ignore") as rf:
+                        req_tk = rf.read().strip().upper()
+                    try:
+                        os.remove(req_path)
+                    except Exception:
+                        pass
+                    if 1 <= len(req_tk) <= 5 and (req_tk.isalpha() or "-" in req_tk):
+                        cfg = load_user_config()
+                        scan_single_ticker_worker(
+                            req_tk, 0, float(cfg.get("iv_drop_thresh", 6.0))
+                        )
+            except Exception:
+                pass
+            time.sleep(3)
 
     def _patrol_loop(self) -> None:
         while True:
             try:
                 cfg = load_user_config()
-                tg_token = cfg.get("tg_token", "").strip()
-                tg_chat_id = cfg.get("tg_chat_id", "").strip()
+                tg_token, tg_chat_id = sanitize_tg_credentials(
+                    cfg.get("tg_token", ""), cfg.get("tg_chat_id", "")
+                )
                 enable_bg = bool(cfg.get("enable_bg_daemon", IS_WINDOWS_VPS))
                 enable_morning = bool(cfg.get("enable_morning_report", True))
                 only_mkt = bool(cfg.get("only_us_market_hours", True))
                 interval_sec = max(int(cfg.get("patrol_interval_min", 15)), 5) * 60
 
                 if enable_bg and tg_token and tg_chat_id:
-                    # 1. 檢查是否進入美股開盤前 15 分鐘早報時間窗 (每日僅發送一次)
                     if enable_morning and is_premarket_briefing_window():
                         if should_send_alert_with_cooldown("MARKET_BRIEFING", "MORNING_REPORT"):
                             core_list = parse_watchlist_string(
@@ -1418,7 +1756,6 @@ class BackgroundPatrolDaemon:
                             if send_telegram_alert(tg_token, tg_chat_id, brief_md):
                                 self.total_pushed += 1
 
-                    # 2. 執行盤中每 15 分鐘全美股 + 核心自選股異動巡邏
                     if not only_mkt or is_us_market_active_window():
                         core_list = parse_watchlist_string(
                             cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
@@ -1458,21 +1795,30 @@ class BackgroundPatrolDaemon:
                 time.sleep(300)
 
     def _tg_command_loop(self) -> None:
+        import requests
+
         while True:
             try:
                 cfg = load_user_config()
-                tg_token = cfg.get("tg_token", "").strip()
-                tg_chat_id = cfg.get("tg_chat_id", "").strip()
+                tg_token, tg_chat_id = sanitize_tg_credentials(
+                    cfg.get("tg_token", ""), cfg.get("tg_chat_id", "")
+                )
                 enable_bg = bool(cfg.get("enable_bg_daemon", IS_WINDOWS_VPS))
                 if not enable_bg or not tg_token or not tg_chat_id:
                     time.sleep(10)
                     continue
 
                 url = f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={self._last_update_id + 1}&timeout=10"
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                try:
+                    resp = requests.get(url, timeout=15, verify=True)
+                except requests.exceptions.SSLError:
+                    resp = requests.get(url, timeout=15, verify=False)
 
+                if resp.status_code != 200:
+                    time.sleep(5)
+                    continue
+
+                data = resp.json()
                 for item in data.get("result", []):
                     self._last_update_id = max(self._last_update_id, int(item["update_id"]))
                     msg_obj = item.get("message", {})
@@ -1483,7 +1829,17 @@ class BackgroundPatrolDaemon:
                         continue
 
                     cmd_clean = text.lstrip("/").replace("gex", "").strip().upper()
-                    if cmd_clean in {"MORNING", "BRIEF", "早報"}:
+                    if cmd_clean in {"STATUS", "狀態"}:
+                        now_tw = (
+                            datetime.datetime.now(datetime.timezone.utc)
+                            + datetime.timedelta(hours=8)
+                        ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+                        send_telegram_alert(
+                            tg_token,
+                            tg_chat_id,
+                            f"✅ *[VPS 後台守護執行中]*\n• 目前時間：`{now_tw}`\n• 累計掃描：`{self.total_scans}` 次\n• 累計推播：`{self.total_pushed}` 則\n• 狀態：`{self.last_run_tw}`",
+                        )
+                    elif cmd_clean in {"MORNING", "BRIEF", "早報"}:
                         core_list = parse_watchlist_string(
                             cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
                         )
@@ -1524,13 +1880,20 @@ def get_demo_scenario_data(
 ) -> Tuple[str, pd.DataFrame, pd.DataFrame, str, float, Optional[float]]:
     np.random.seed(42)
     n_bars = 45
+    base_dt = datetime.date(2026, 9, 14)
+    dates = [
+        (base_dt + datetime.timedelta(days=int(i * 1.4))).strftime("%Y-%m-%d")
+        for i in range(n_bars)
+    ]
     if scenario == "NVDA_SQUEEZE":
-        base_prices = np.linspace(156.0, 168.5, n_bars - 1).tolist() + [171.40]
-        opens = [p - np.random.uniform(-1.2, 1.2) for p in base_prices[:-1]] + [168.20]
-        highs = [max(o, c) + np.random.uniform(0.5, 1.8) for o, c in zip(opens[:-1], base_prices[:-1])] + [172.30]
-        lows = [min(o, c) - np.random.uniform(0.5, 1.6) for o, c in zip(opens[:-1], base_prices[:-1])] + [167.90]
+        base_prices = np.linspace(152.0, 168.5, n_bars - 1).tolist() + [171.40]
+        opens = [p - np.random.uniform(-1.5, 1.5) for p in base_prices[:-1]] + [168.20]
+        highs = [max(o, c) + np.random.uniform(0.6, 2.2) for o, c in zip(opens[:-1], base_prices[:-1])] + [172.30]
+        lows = [min(o, c) - np.random.uniform(0.6, 2.0) for o, c in zip(opens[:-1], base_prices[:-1])] + [167.90]
         vols = [np.random.uniform(35e6, 52e6) for _ in range(n_bars - 1)] + [88e6]
-        df_ohlcv = pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": base_prices, "Volume": vols})
+        df_ohlcv = pd.DataFrame(
+            {"Date": dates, "Open": opens, "High": highs, "Low": lows, "Close": base_prices, "Volume": vols}
+        ).set_index("Date")
 
         strikes = np.arange(140, 195, 5, dtype=float)
         df_chain = pd.DataFrame({
@@ -1542,14 +1905,16 @@ def get_demo_scenario_data(
             "call_iv": [0.82, 0.80, 0.78, 0.76, 0.75, 0.77, 0.81, 0.85, 0.89, 0.92, 0.95],
             "put_iv": [0.96, 0.92, 0.88, 0.85, 0.82, 0.80, 0.82, 0.84, 0.85, 0.86, 0.87],
         })
-        return "NVDA", df_ohlcv, df_chain, "2026-11-20", 5.0, 81.5
+        return "NVDA", df_ohlcv, df_chain, "2026-11-20 (主力OI，聚合4期)", 5.0, 81.5
     else:
-        base_prices = np.linspace(160.0, 179.2, n_bars - 1).tolist() + [178.40]
-        opens = [p - np.random.uniform(-1.0, 1.2) for p in base_prices[:-1]] + [179.10]
-        highs = [max(o, c) + np.random.uniform(0.4, 1.5) for o, c in zip(opens[:-1], base_prices[:-1])] + [182.60]
-        lows = [min(o, c) - np.random.uniform(0.4, 1.4) for o, c in zip(opens[:-1], base_prices[:-1])] + [177.80]
+        base_prices = np.linspace(155.0, 179.2, n_bars - 1).tolist() + [178.40]
+        opens = [p - np.random.uniform(-1.2, 1.4) for p in base_prices[:-1]] + [179.10]
+        highs = [max(o, c) + np.random.uniform(0.5, 1.8) for o, c in zip(opens[:-1], base_prices[:-1])] + [182.60]
+        lows = [min(o, c) - np.random.uniform(0.5, 1.6) for o, c in zip(opens[:-1], base_prices[:-1])] + [177.80]
         vols = [np.random.uniform(45e6, 68e6) for _ in range(n_bars - 1)] + [38e6]
-        df_ohlcv = pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": base_prices, "Volume": vols})
+        df_ohlcv = pd.DataFrame(
+            {"Date": dates, "Open": opens, "High": highs, "Low": lows, "Close": base_prices, "Volume": vols}
+        ).set_index("Date")
 
         strikes = np.arange(140, 195, 5, dtype=float)
         df_chain = pd.DataFrame({
@@ -1561,26 +1926,30 @@ def get_demo_scenario_data(
             "call_iv": [0.76, 0.75, 0.74, 0.73, 0.72, 0.73, 0.75, 0.76, 0.77, 0.79, 0.81],
             "put_iv": [0.88, 0.85, 0.82, 0.80, 0.78, 0.77, 0.76, 0.76, 0.77, 0.78, 0.79],
         })
-        return "NVDA", df_ohlcv, df_chain, "2026-11-20", 4.0, 88.0
+        return "NVDA", df_ohlcv, df_chain, "2026-11-20 (主力OI，聚合4期)", 4.0, 88.0
 
 
 # ============================================================================
-# 6. Streamlit 網頁戰情室 (雙軌自動分流 + 14 顆核心快捷鍵 + 開盤前早報控制)
+# 6. Streamlit 網頁戰情室 (首頁預設顯示 14 檔正負 Gamma 燈號 + 納指方向研判 + 手機防重疊日K圖)
 # ============================================================================
 def run_streamlit_warroom() -> None:
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
     import streamlit as st
 
     st.set_page_config(
-        page_title="全美股期權 GEX 與 Gamma Squeeze 戰情室",
+        page_title="全美股期權 GEX 與納指方向戰情室",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
 
     @st.cache_resource
     def get_bg_daemon() -> BackgroundPatrolDaemon:
         return BackgroundPatrolDaemon()
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def cached_core_14_scan(wl_tuple: Tuple[str, ...], iv_thresh: float) -> Dict[str, WarRoomSnapshot]:
+        raw_map = scan_core_14_tickers_map(list(wl_tuple), iv_thresh)
+        return {k: v[0] for k, v in raw_map.items()}
 
     daemon = get_bg_daemon()
     cfg = load_user_config()
@@ -1601,22 +1970,22 @@ def run_streamlit_warroom() -> None:
     role_badge = (
         "🖥️ 24H Windows VPS 巡邏主機"
         if IS_WINDOWS_VPS
-        else "📱 Streamlit Cloud 手機加密看盤端"
+        else "📱 Streamlit Cloud 手機看盤端"
     )
-    st.title(f"🌎 全美股期權 GEX 正負 Gamma 雷達 ({role_badge})")
+    st.markdown(f"### 🌎 美股期權 GEX 戰情室 ({role_badge})")
 
     with st.sidebar:
-        st.header("⚙️ 雙軌戰情室設定")
+        st.header("⚙️ 戰情室與推播設定")
         app_tab = st.radio(
             "選擇功能模式",
             [
-                "🔍 單股隨選戰情室 (支援全美股任一代號)",
-                "🌎 全美股批次掃描雷達",
+                "🚦 核心 14 檔燈號總覽 & 單股日K診斷 (首頁預設)",
+                "🌎 全美股 5,000+ 檔批次掃描雷達",
             ],
             index=0,
         )
         iv_drop_thresh = st.slider(
-            "IV 高點回落衰竭警報門檻 (相對回落 %)",
+            "IV 高點回落衰竭警報門檻 (%)",
             3.0,
             15.0,
             float(cfg.get("iv_drop_thresh", 6.0)),
@@ -1624,36 +1993,37 @@ def run_streamlit_warroom() -> None:
         )
 
         st.divider()
-        st.subheader("🌅 每日開盤前早報與核心自選股")
+        st.subheader("🌅 核心自選股與每日早報")
         core_wl_str = st.text_area(
-            "核心自選股清單 (預設含 NVDA, TSLA, LUNR, SPCX 與納指前十大)",
+            "核心自選股清單 (含 NVDA, TSLA, LUNR, SPCX 與納指前十大)",
             value=cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST)),
             height=90,
         )
         enable_morning = st.checkbox(
-            "每日美股開盤前 15 分鐘自動發送 GEX 早報 (22:15 / 21:15 UTC+8)",
+            "每日美股開盤前 15 分鐘自動發送早報 (22:15 / 21:15 UTC+8)",
             value=bool(cfg.get("enable_morning_report", True)),
         )
 
         st.divider()
-        st.subheader("📲 Telegram 與雙軌分工設定")
-        tg_token = st.text_input(
+        st.subheader("📲 Telegram 推播與背景常駐")
+        tg_token_raw = st.text_input(
             "Telegram Bot Token", value=cfg.get("tg_token", ""), type="password"
         )
-        tg_chat_id = st.text_input(
+        tg_chat_id_raw = st.text_input(
             "Telegram Chat ID", value=cfg.get("tg_chat_id", "")
         )
+        tg_token, tg_chat_id = sanitize_tg_credentials(tg_token_raw, tg_chat_id_raw)
+
         enable_bg = st.checkbox(
-            "啟用 24H 後台巡邏與 TG 雙向回覆 (VPS 自動勾選 / 雲端自動關閉防衝突)",
+            "啟用 24H 後台巡邏與 TG 雙向回覆 (VPS 自動勾選)",
             value=bool(cfg.get("enable_bg_daemon", IS_WINDOWS_VPS)),
         )
         only_mkt = st.checkbox(
-            "僅於美股交易時段巡邏 (週末與休市自動待機)",
+            "僅於美股交易時段巡邏",
             value=bool(cfg.get("only_us_market_hours", True)),
         )
         st.caption(
-            f"🤖 後台狀態：已巡邏 `{daemon.total_scans}` 次 | 已推播 `{daemon.total_pushed}` 則 | `{daemon.last_run_tw}`\n"
-            f"💬 手機 Telegram 傳送任意代號 (如 `NVDA`) 或傳送 `早報` 即可即時取得報告！"
+            f"🤖 後台狀態：已巡邏 `{daemon.total_scans}` 次 | 已推播 `{daemon.total_pushed}` 則 | `{daemon.last_run_tw}`"
         )
 
         if (
@@ -1665,84 +2035,115 @@ def run_streamlit_warroom() -> None:
             or enable_bg != cfg.get("enable_bg_daemon")
             or only_mkt != cfg.get("only_us_market_hours")
         ):
-            cfg["tg_token"] = tg_token.strip()
-            cfg["tg_chat_id"] = tg_chat_id.strip()
+            cfg["tg_token"] = tg_token
+            cfg["tg_chat_id"] = tg_chat_id
             cfg["core_watchlist"] = core_wl_str.strip()
             cfg["enable_morning_report"] = enable_morning
             cfg["iv_drop_thresh"] = iv_drop_thresh
             cfg["enable_bg_daemon"] = enable_bg
             cfg["only_us_market_hours"] = only_mkt
             save_user_config(cfg)
-            st.toast("✅ 已自動儲存核心自選股與早報設定！")
+            st.toast("✅ 已儲存設定！")
 
         if st.button("🌅 立即發送今日開盤前早報至 Telegram"):
-            if not tg_token.strip() or not tg_chat_id.strip():
-                st.error("請先在上方填入 Telegram Bot Token 與 Chat ID！")
+            if not tg_token or not tg_chat_id:
+                st.error("請先填入 Telegram Bot Token 與 Chat ID！")
             else:
-                with st.spinner("正在掃描 SPY, QQQ 與 12 檔核心自選股早報數據..."):
+                with st.spinner("正在計算納指方向與 14 檔核心股早報..."):
                     c_list = parse_watchlist_string(core_wl_str)
                     brief_txt = generate_morning_briefing_report(c_list, iv_drop_thresh)
-                    ok_b = send_telegram_alert(tg_token.strip(), tg_chat_id.strip(), brief_txt)
+                    ok_b, detail_b = send_telegram_alert_with_detail(
+                        tg_token, tg_chat_id, brief_txt
+                    )
                 if ok_b:
-                    st.success("🎉 開盤前 GEX 戰情早報已發送至你的手機 Telegram！")
+                    st.success(f"🎉 清爽版開盤前早報已發送至 Telegram！({detail_b})")
                 else:
-                    st.error("發送失敗，請確認 Token 與 Chat ID 是否正確。")
+                    st.error(f"發送失敗：{detail_b}")
 
-        if st.button("📨 發送單股雙拼圖測試推播至 Telegram"):
-            if not tg_token.strip() or not tg_chat_id.strip():
-                st.error("請先在上方填入 Telegram Bot Token 與 Chat ID！")
-            else:
-                tk_d, df_o_d, df_c_d, exp_d, dte_d, sim_p = get_demo_scenario_data("NVDA_SQUEEZE")
-                snap_d, df_gex_d = evaluate_snapshot_and_alerts(
-                    tk_d, df_o_d, df_c_d, exp_d, dte_d, iv_drop_thresh, sim_p
-                )
-                test_png = os.path.join(BASE_DIR, "Telegram_Test_WarRoom_Alert.png")
-                render_warroom_chart_png(snap_d, df_o_d, df_gex_d, test_png)
-                ok = send_telegram_alert(
-                    tg_token.strip(),
-                    tg_chat_id.strip(),
-                    "✅ *[雙軌系統測試推播成功]* 你可直接在此聊天室輸入任意美股代號 (如 `NVDA`、`LUNR`、`SPCX`) 或輸入 `早報`！\n\n"
-                    + format_telegram_card_message(snap_d),
-                    test_png,
-                )
-                if ok:
-                    st.success("🎉 測試推播已發送！請查看你的手機 Telegram。")
-                else:
-                    st.error("推播失敗，請確認 Token、Chat ID 是否正確，且已對機器人點擊 Start。")
+        if st.button("📈 立即同步 SPY/QQQ 與 12 檔核心股 GEX 至 MT5 (Common\\Files)"):
+            with st.spinner("正在寫入 MT5 Common\\Files\\gex_mt5_levels.csv..."):
+                c_list = parse_watchlist_string(core_wl_str)
+                _ = generate_morning_briefing_report(c_list, iv_drop_thresh)
+                mt5_csv_p = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
+            st.success(f"✅ 已同步 14 檔核心股至 MT5：`{mt5_csv_p}`")
 
         if IS_WINDOWS_VPS:
-            if st.button("⚡ 一鍵加入 Windows VPS 開機自動啟動"):
-                ok_st, msg_st = register_windows_startup()
+            if st.button("👻 一鍵啟動『無黑窗隱形背景常駐』並加入開機自啟 (按完即可關掉 CMD)"):
+                ok_st, msg_st = enable_invisible_windows_background_service()
                 if ok_st:
-                    st.success(f"已寫入 Windows 啟動資料夾：{msg_st}")
+                    st.success(msg_st)
                 else:
                     st.error(f"設定失敗：{msg_st}")
 
-    if app_tab.startswith("🔍"):
-        # 手機快速點擊大盤 + 12 檔核心自選股按鈕列 (共 14 顆，分兩排 7x2 呈現)
-        st.caption("📱 點擊下方大盤與核心自選股快捷按鈕（含 NVDA、TSLA、LUNR、SPCX 與納指前十大）或直接輸入任一代號：")
-        quick_list = MARKET_INDEX_TICKERS + parse_watchlist_string(core_wl_str)
-        if "selected_ticker" not in st.session_state:
-            st.session_state["selected_ticker"] = "NVDA"
+    core_list = parse_watchlist_string(core_wl_str)
+    quick_14_list = list(dict.fromkeys(MARKET_INDEX_TICKERS + core_list))
 
-        row1 = quick_list[:7]
-        row2 = quick_list[7:14]
-        cols_r1 = st.columns(len(row1))
-        for idx, q_tk in enumerate(row1):
-            if cols_r1[idx].button(q_tk, use_container_width=True, key=f"q1_{q_tk}"):
-                st.session_state["selected_ticker"] = q_tk
-        if row2:
-            cols_r2 = st.columns(len(row2))
-            for idx, q_tk in enumerate(row2):
-                if cols_r2[idx].button(q_tk, use_container_width=True, key=f"q2_{q_tk}"):
-                    st.session_state["selected_ticker"] = q_tk
+    if app_tab.startswith("🚦"):
+        # ====================================================================
+        # 首頁第一區塊：自動載入「納斯達克前十大 Gamma 總體方向研判」+「核心 14 檔正負 Gamma 燈號牆」
+        # ====================================================================
+        top_c1, top_c2 = st.columns([4, 1])
+        with top_c1:
+            st.markdown("#### 🧭 一、 納斯達克 100 (QQQ + 前十大權重股) 總體 Gamma 狀況與方向研判")
+        with top_c2:
+            if st.button("🔄 刷新 14 檔燈號", use_container_width=True):
+                cached_core_14_scan.clear()
+
+        with st.spinner("正在同步核心 14 檔與納斯達克前十大期權 GEX 燈號..."):
+            snap_map = cached_core_14_scan(tuple(core_list), iv_drop_thresh)
+
+        if snap_map:
+            ndx_info = analyze_nasdaq_top10_direction(snap_map)
+            if ndx_info["pos_count"] >= 6:
+                st.success(
+                    f"**{ndx_info['overall_badge']}**\n\n"
+                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
+                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
+                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
+                )
+            elif ndx_info["neg_count"] >= 6:
+                st.error(
+                    f"**{ndx_info['overall_badge']}**\n\n"
+                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
+                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
+                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
+                )
+            else:
+                st.warning(
+                    f"**{ndx_info['overall_badge']}**\n\n"
+                    f"• **前十大權重股正負 Gamma 比**：🟢 正 Gamma `{ndx_info['pos_count']} 檔` vs 🔴 負 Gamma `{ndx_info['neg_count']} 檔` "
+                    f"｜ **前十大合計 Net GEX**：`{ndx_info['total_ndx_gex']:+.1f}M` ｜ **QQQ Net GEX**：`{ndx_info['qqq_gex']:+.1f}M`\n\n"
+                    f"• **整體方向與操作建議**：{ndx_info['direction_summary']}"
+                )
+
+            st.markdown("#### 🚦 二、 核心 14 檔（SPY/QQQ + 12 檔核心自選股）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
+            if "selected_ticker" not in st.session_state:
+                st.session_state["selected_ticker"] = "AAPL"
+
+            # 以每列 2 欄 (手機友善) 或 4 欄展示 14 檔核心燈號卡
+            grid_cols = st.columns(4)
+            for idx, tk_sym in enumerate(quick_14_list):
+                col_obj = grid_cols[idx % 4]
+                sn = snap_map.get(tk_sym)
+                if sn is not None:
+                    chg_p = ((sn.spot_price - sn.prev_close) / max(sn.prev_close, 0.01)) * 100.0
+                    lamp = "🟢 正Gamma" if sn.is_positive_gamma else "🔴 負Gamma"
+                    btn_label = (
+                        f"{lamp}｜{sn.ticker} ${sn.spot_price:.2f} ({chg_p:+.1f}%)\n"
+                        f"Put牆 ${sn.put_wall:.0f} ⟷ Call牆 ${sn.call_wall:.0f} (GEX {sn.net_gex_millions:+.0f}M)"
+                    )
+                    if col_obj.button(btn_label, key=f"lamp_{tk_sym}", use_container_width=True):
+                        st.session_state["selected_ticker"] = tk_sym
+
+        st.divider()
+        st.markdown("#### 📈 三、 單股標準日 K 線 (含 MA5/MA10/MA20) 與期權 GEX 支撐壓力牆")
 
         col_inp1, col_inp2, col_inp3 = st.columns([2, 1, 2])
         with col_inp1:
             ticker_input = (
                 st.text_input(
                     "輸入任意美股代號 (支援全美股 5,000+ 檔)",
-                    value=st.session_state["selected_ticker"],
+                    value=st.session_state.get("selected_ticker", "AAPL"),
                 )
                 .strip()
                 .upper()
@@ -1750,107 +2151,194 @@ def run_streamlit_warroom() -> None:
             st.session_state["selected_ticker"] = ticker_input
         with col_inp2:
             exp_idx = st.number_input(
-                "到期日順位 (0=最近週五)", min_value=0, max_value=8, value=0
+                "期權範圍 (0=近4期聚合含週五OPEX)", min_value=0, max_value=8, value=0
             )
         with col_inp3:
-            data_source = st.selectbox(
-                "資料來源",
-                ["即時連線全美股 (yfinance)", "離線模擬 (NVDA 軋空啟動)", "離線模擬 (NVDA IV 回落衰竭)"],
+            lock_zoom = st.checkbox(
+                "📱 鎖定手機觸控比例 (防止手指滑動時圖表跑版，勾選後用上方按鈕切換股票)",
+                value=True,
             )
 
+        view_mode = st.radio(
+            "🔍 選擇 K 線週期與期權牆放大視角（解決日線跨度太大導致近期 Call/Put 牆擠在一起的問題）",
+            [
+                "🎯 日K期權牆聚焦視角 (近15日日K + 自動鎖定期權牆區間放大Y軸，預設最清晰)",
+                "⚡ 60分K短線作戰視角 (近8日小時K，適合Call/Put牆距離極近時拉開空間)",
+                "📅 日K波段全景視角 (近45日完整日K，檢視三個月大波段趨勢)",
+            ],
+            index=0,
+            horizontal=True,
+        )
+
+        k_interval = "60m" if view_mode.startswith("⚡") else "1d"
+        k_period = "1mo" if view_mode.startswith("⚡") else "3mo"
+
         try:
-            if data_source.startswith("即時連線"):
-                tk, df_ohlcv, df_chain, exp_d, dte = fetch_live_market_data(
-                    ticker_input, int(exp_idx)
-                )
-                sim_peak = None
-            elif "軋空啟動" in data_source:
-                tk, df_ohlcv, df_chain, exp_d, dte, sim_peak = get_demo_scenario_data("NVDA_SQUEEZE")
-            else:
-                tk, df_ohlcv, df_chain, exp_d, dte, sim_peak = get_demo_scenario_data("NVDA_IV_CRUSH")
+            tk, df_ohlcv, df_chain, exp_d, dte = fetch_live_market_data(
+                ticker_input, int(exp_idx), interval=k_interval, period=k_period
+            )
+            sim_peak = None
         except Exception as e:
-            st.warning(f"即時連線失敗 ({e})，自動切換至內建 NVDA 實戰數據。")
+            st.warning(f"即時連線失敗 ({e})，自動載入內建 NVDA 數據。")
             tk, df_ohlcv, df_chain, exp_d, dte, sim_peak = get_demo_scenario_data("NVDA_SQUEEZE")
 
         snap, df_gex = evaluate_snapshot_and_alerts(
             tk, df_ohlcv, df_chain, exp_d, dte, iv_drop_thresh, sim_peak
         )
 
-        fig = make_subplots(
-            rows=1,
-            cols=2,
-            shared_yaxes=True,
-            column_widths=[0.72, 0.28],
-            horizontal_spacing=0.02,
-            subplot_titles=(
-                f"{snap.ticker} K 線與期權關鍵牆 (現價 ${snap.spot_price:.2f})",
-                f"各履約價 Net GEX (總計 {snap.net_gex_millions:+.1f}M)",
-            ),
-        )
+        df_full = df_ohlcv.copy()
+        df_full["MA5"] = df_full["Close"].rolling(5, min_periods=1).mean()
+        df_full["MA10"] = df_full["Close"].rolling(10, min_periods=1).mean()
+        df_full["MA20"] = df_full["Close"].rolling(20, min_periods=1).mean()
 
-        df_k = df_ohlcv.tail(50).reset_index()
-        x_labels = (
-            df_k.iloc[:, 0].astype(str)
-            if "Date" in df_k.columns or "Datetime" in df_k.columns
-            else df_k.index.astype(str)
-        )
+        if view_mode.startswith("🎯"):
+            df_k = df_full.tail(15).copy()
+            x_dates = extract_mmdd_labels(df_k)
+            k_low = float(df_k["Low"].min())
+            k_high = float(df_k["High"].max())
+            y_min = min(k_low, snap.put_wall, snap.next_lower_put_wall, snap.zero_gamma_flip) * 0.990
+            y_max = max(k_high, snap.call_wall, snap.next_upper_call_wall, snap.bull_exhaustion_price) * 1.010
+        elif view_mode.startswith("⚡"):
+            df_k = df_full.tail(35).copy()
+            x_dates = [str(idx)[5:16] for idx in df_k.index]
+            k_low = float(df_k["Low"].min())
+            k_high = float(df_k["High"].max())
+            y_min = min(k_low, snap.put_wall, snap.next_lower_put_wall, snap.zero_gamma_flip) * 0.992
+            y_max = max(k_high, snap.call_wall, snap.next_upper_call_wall, snap.bull_exhaustion_price) * 1.008
+        else:
+            df_k = df_full.tail(45).copy()
+            x_dates = extract_mmdd_labels(df_k)
+            k_low = float(df_k["Low"].min())
+            k_high = float(df_k["High"].max())
+            y_min = min(k_low, snap.put_wall, snap.zero_gamma_flip) * 0.985
+            y_max = max(k_high, snap.call_wall, snap.bull_exhaustion_price) * 1.015
 
-        fig.add_trace(
+        # 【圖表 1：獨立滿版日 K 線圖 (消除週末斷層、使用圖例與防重疊標籤，手機絕不擠成一團)】
+        fig_k = go.Figure()
+        fig_k.add_trace(
             go.Candlestick(
-                x=x_labels,
+                x=x_dates,
                 open=df_k["Open"],
                 high=df_k["High"],
                 low=df_k["Low"],
                 close=df_k["Close"],
-                name="K線",
+                name="日K線",
                 increasing_line_color="#00E676",
                 decreasing_line_color="#FF5252",
-            ),
-            row=1,
-            col=1,
+            )
+        )
+        fig_k.add_trace(
+            go.Scatter(x=x_dates, y=df_k["MA5"], mode="lines", name="MA5", line=dict(color="#FF9800", width=1.5))
+        )
+        fig_k.add_trace(
+            go.Scatter(x=x_dates, y=df_k["MA10"], mode="lines", name="MA10", line=dict(color="#29B6F6", width=1.5))
+        )
+        fig_k.add_trace(
+            go.Scatter(x=x_dates, y=df_k["MA20"], mode="lines", name="MA20", line=dict(color="#AB47BC", width=1.6))
         )
 
+        # 用獨立 Scatter 線條加入 Legend 圖例（不直接在 K 線中間疊字，徹底解決手機字體重疊）
+        cw_st_lbl = (
+            f"主力 Call 牆(已突破轉撐) ${snap.call_wall:.2f}"
+            if snap.call_wall < snap.spot_price
+            else f"主力 Call 壓力牆 ${snap.call_wall:.2f}"
+        )
+        pw_st_lbl = (
+            f"主力 Put 牆(已跌破轉壓) ${snap.put_wall:.2f}"
+            if snap.put_wall > snap.spot_price
+            else f"主力 Put 支撐牆 ${snap.put_wall:.2f}"
+        )
         key_lines = [
-            (snap.call_wall, f"Call 壓力牆 ${snap.call_wall:.2f}", "#FF5252", "solid"),
-            (snap.put_wall, f"Put 支撐牆 ${snap.put_wall:.2f}", "#00E676", "solid"),
-            (snap.zero_gamma_flip, f"Zero Gamma ${snap.zero_gamma_flip:.2f}", "#FFD600", "dash"),
-            (snap.max_pain, f"Max Pain ${snap.max_pain:.2f}", "#40C4FF", "dot"),
-            (snap.bull_squeeze_trigger, f"Squeeze 啟動 ${snap.bull_squeeze_trigger:.2f}", "#FF9100", "dashdot"),
-            (snap.bull_exhaustion_price, f"Squeeze 衰竭 ${snap.bull_exhaustion_price:.2f}", "#E040FB", "dashdot"),
+            (snap.bull_exhaustion_price, f"Squeeze 衰竭天花板 ${snap.bull_exhaustion_price:.2f}", "#E040FB", "dashdot"),
+            (snap.call_wall, cw_st_lbl, "#FF5252", "solid"),
+            (snap.bull_squeeze_trigger, f"Squeeze 向上啟動 ${snap.bull_squeeze_trigger:.2f}", "#FF9100", "dashdot"),
+            (snap.max_pain, f"Max Pain 最大痛點 ${snap.max_pain:.2f}", "#40C4FF", "dot"),
+            (snap.zero_gamma_flip, f"Zero Gamma 翻轉點 ${snap.zero_gamma_flip:.2f}", "#FFD600", "dash"),
+            (snap.put_wall, pw_st_lbl, "#00E676", "solid"),
         ]
+        if snap.call_wall < snap.spot_price and snap.next_upper_call_wall > snap.spot_price:
+            key_lines.append((snap.next_upper_call_wall, f"上方次級 Call 牆 ${snap.next_upper_call_wall:.2f}", "#FF8A80", "dash"))
+        if snap.put_wall > snap.spot_price and snap.next_lower_put_wall < snap.spot_price:
+            key_lines.append((snap.next_lower_put_wall, f"下方次級 Put 牆 ${snap.next_lower_put_wall:.2f}", "#69F0AE", "dash"))
         for y_val, label_txt, color_hex, dash_style in key_lines:
-            fig.add_hline(
-                y=y_val,
-                line_dash=dash_style,
-                line_color=color_hex,
-                annotation_text=label_txt,
-                annotation_position="top left",
-                row=1,
-                col=1,
+            fig_k.add_trace(
+                go.Scatter(
+                    x=[x_dates[0], x_dates[-1]],
+                    y=[y_val, y_val],
+                    mode="lines",
+                    name=label_txt,
+                    line=dict(color=color_hex, width=2.0, dash=dash_style),
+                    hoverinfo="name+y",
+                )
             )
 
-        bar_colors = ["#00E676" if v >= 0 else "#FF1744" for v in df_gex["net_gex_m"]]
-        fig.add_trace(
-            go.Bar(
-                x=df_gex["net_gex_m"],
-                y=df_gex["strike"],
+        chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
+        fig_k.update_layout(
+            title=dict(
+                text=f"{snap.ticker} 日 K 線與期權關鍵牆｜現價 ${snap.spot_price:.2f} ({chg_pct:+.2f}%)｜昨收 ${snap.prev_close:.2f}",
+                font=dict(size=15),
+            ),
+            template="plotly_dark",
+            height=500,
+            margin=dict(l=10, r=10, t=45, b=35),
+            xaxis=dict(
+                type="category",
+                rangeslider=dict(visible=False),
+                nticks=9,
+                fixedrange=lock_zoom,
+            ),
+            yaxis=dict(
+                range=[y_min, y_max],
+                side="right",
+                fixedrange=lock_zoom,
+            ),
+            legend=dict(
                 orientation="h",
+                yanchor="bottom",
+                y=-0.32,
+                xanchor="left",
+                x=0.0,
+                font=dict(size=11),
+            ),
+            dragmode=False if lock_zoom else "pan",
+        )
+        st.plotly_chart(
+            fig_k,
+            use_container_width=True,
+            config={"scrollZoom": not lock_zoom, "displayModeBar": not lock_zoom},
+        )
+
+        # 【圖表 2：獨立滿版各履約價 Net GEX 柱狀圖 (上下分開排列，手機清楚好讀)】
+        df_sub_gex = df_gex[(df_gex["strike"] >= y_min) & (df_gex["strike"] <= y_max)].copy()
+        bar_colors = ["#00E676" if v >= 0 else "#FF1744" for v in df_sub_gex["net_gex_m"]]
+        fig_gex = go.Figure()
+        fig_gex.add_trace(
+            go.Bar(
+                x=df_sub_gex["strike"].astype(str),
+                y=df_sub_gex["net_gex_m"],
                 marker_color=bar_colors,
                 name="Net GEX (M$)",
+            )
+        )
+        fig_gex.update_layout(
+            title=dict(
+                text=f"{snap.ticker} 各履約價 Net GEX 籌碼分佈 (總淨曝險: {snap.net_gex_millions:+.1f}M 美元)",
+                font=dict(size=14),
             ),
-            row=1,
-            col=2,
-        )
-
-        fig.update_layout(
             template="plotly_dark",
-            height=620,
-            xaxis_rangeslider_visible=False,
-            showlegend=False,
+            height=300,
+            margin=dict(l=10, r=10, t=40, b=30),
+            xaxis=dict(title="履約價 (Strike $)", type="category", fixedrange=lock_zoom),
+            yaxis=dict(title="Net GEX (M$)", side="right", fixedrange=lock_zoom),
+            dragmode=False if lock_zoom else "pan",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig_gex,
+            use_container_width=True,
+            config={"scrollZoom": not lock_zoom, "displayModeBar": not lock_zoom},
+        )
 
-        st.markdown("### 🧭 期權籌碼診斷與即時警報卡片")
+        st.markdown("#### 🧭 四、 單股期權籌碼診斷戰情卡")
         st.markdown(format_telegram_card_message(snap))
 
     else:
@@ -1897,7 +2385,7 @@ def run_streamlit_warroom() -> None:
                 with st.expander(
                     f"{'🚨 [觸發警報] ' if snap.active_alerts else ''}{snap.ticker} | 現價 ${snap.spot_price:.2f} | "
                     f"{'🟢 正 Gamma' if snap.is_positive_gamma else '🔴 負 Gamma'} (Net GEX {snap.net_gex_millions:+.1f}M) | "
-                    f"Call牆 ${snap.call_wall:.1f} / Put牆 ${snap.put_wall:.1f} / Max Pain ${snap.max_pain:.1f}",
+                    f"Put牆 ${snap.put_wall:.1f} ⟷ 痛點 ${snap.max_pain:.1f} ⟷ Call牆 ${snap.call_wall:.1f}",
                     expanded=bool(snap.active_alerts),
                 ):
                     st.markdown(format_telegram_card_message(snap))
@@ -1910,13 +2398,14 @@ def run_streamlit_warroom() -> None:
 
 
 # ============================================================================
-# 7. CLI 命令列自檢與背景巡邏入口
+# 7. CLI 命令列與無黑窗隱形常駐入口 (--daemon-loop)
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description="All-in-One US Options GEX War Room")
-    parser.add_argument("--patrol", action="store_true", help="背景自動巡邏模式")
+    parser.add_argument("--patrol", action="store_true", help="單次背景自動巡邏模式")
+    parser.add_argument("--daemon-loop", action="store_true", help="無黑窗 24H 隱形常駐守護模式")
     parser.add_argument("--morning", action="store_true", help="立即產生並發送今日開盤前早報")
-    parser.add_argument("--test-self", action="store_true", help="執行單檔完整性自檢")
+    parser.add_argument("--test-self", action="store_true", help="執行單檔完整性自檢與日K圖繪製驗證")
     args, _ = parser.parse_known_args()
 
     if is_running_inside_streamlit():
@@ -1926,10 +2415,18 @@ def main() -> None:
     if args.test_self:
         tk, df_ohlcv, df_chain, exp_d, dte, sim_peak = get_demo_scenario_data("NVDA_SQUEEZE")
         snap, df_gex = evaluate_snapshot_and_alerts(tk, df_ohlcv, df_chain, exp_d, dte, 6.0, sim_peak)
-        sample_line = format_single_line_brief(snap)
-        print(f"✅ [開盤前自動早報 + 12 檔核心自選股版自檢通過] 核心清單={DEFAULT_CORE_WATCHLIST}")
-        print(sample_line)
+        test_png = os.path.join(BASE_DIR, "NVDA_DailyK_Verified_Preview.png")
+        render_warroom_chart_png(snap, df_ohlcv, df_gex, test_png)
+        print(
+            f"✅ [日K對齊與防重疊版自檢通過] {snap.ticker} Spot=${snap.spot_price:.2f} | "
+            f"Put牆=${snap.put_wall:.1f} < Spot < Call牆=${snap.call_wall:.1f} | Net GEX={snap.net_gex_millions:+.2f}M"
+        )
         return
+
+    if args.daemon_loop:
+        _daemon = BackgroundPatrolDaemon()
+        while True:
+            time.sleep(3600)
 
     cfg = load_user_config()
     if args.morning:
