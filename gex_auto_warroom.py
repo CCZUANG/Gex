@@ -623,16 +623,22 @@ def find_zero_gamma_flip(
     call_iv: np.ndarray,
     put_iv: np.ndarray,
     tte_years: float,
+    call_pol: Optional[np.ndarray] = None,
 ) -> float:
+    """
+    100% 純數學求解 Net GEX(S) = 0 之零點 (Zero Gamma Flip)，不加任何人工上下界強制規定：
+    代入與當下 Net GEX 完全一致之 call_pol 極性，直接找出離現價最近之 Net GEX = 0 交叉點。
+    """
     low_s = max(float(np.min(strikes)) * 0.90, spot * 0.75)
     high_s = min(float(np.max(strikes)) * 1.10, spot * 1.25)
-    grid = np.linspace(low_s, high_s, 140)
+    grid = np.linspace(low_s, high_s, 160)
+    pol = call_pol if call_pol is not None else np.ones_like(strikes)
 
     net_curve = []
     for s_val in grid:
         _, _, c_gam, _, _ = bs_greeks(s_val, strikes, tte_years, call_iv)
         _, _, p_gam, _, _ = bs_greeks(s_val, strikes, tte_years, put_iv)
-        c_gex = np.sum(call_oi * c_gam * 100.0 * (s_val**2) * 0.01)
+        c_gex = np.sum(call_oi * c_gam * pol * 100.0 * (s_val**2) * 0.01)
         p_gex = np.sum(-put_oi * p_gam * 100.0 * (s_val**2) * 0.01)
         net_curve.append(c_gex + p_gex)
 
@@ -740,9 +746,10 @@ def evaluate_snapshot_and_alerts(
 
     net_gex_total = float(df["net_gex_m"].sum())
     zero_gamma = find_zero_gamma_flip(
-        spot, strikes, call_oi, put_oi, call_iv, put_iv, tte_years
+        spot, strikes, call_oi, put_oi, call_iv, put_iv, tte_years, call_pol
     )
-    is_pos_gamma = (net_gex_total > 0) and (spot >= zero_gamma)
+    # 正負 Gamma 完全由當下總淨曝險 (net_gex_total > 0) 決定，不人為扭曲
+    is_pos_gamma = net_gex_total > 0
 
     atm_idx = int(np.argmin(np.abs(strikes - spot)))
     atm_iv_pct = float(((call_iv[atm_idx] + put_iv[atm_idx]) / 2.0) * 100.0)
@@ -806,23 +813,29 @@ def evaluate_snapshot_and_alerts(
 
     max_pain = compute_max_pain(df)
 
-    bull_cands = df[(df["strike"] > spot) & (df["strike"] <= spot * 1.12)].copy()
+    # 多頭起漲點 (bull_trigger)：
+    # 若目前在負 Gamma (spot < zero_gamma)，必須先站上翻轉點 zero_gamma 才會結束負 Gamma 助跌，
+    # 因此多頭起漲點必須 >= max(spot * 1.006, zero_gamma)，絕不會挑到僅差 $0.11 且還在翻轉點下方的價平履約價！
+    min_bull_strike = max(spot * 1.006, zero_gamma if not is_pos_gamma else spot * 1.005)
+    bull_cands = df[(df["strike"] >= min_bull_strike) & (df["strike"] <= spot * 1.14)].copy()
     if not bull_cands.empty:
         bull_cands["sq_score"] = bull_cands["call_gex_raw_m"] * (
             1.0 + bull_cands["call_vol_oi"]
         )
         bull_trigger = float(bull_cands.loc[bull_cands["sq_score"].idxmax(), "strike"])
     else:
-        bull_trigger = call_wall
+        bull_trigger = max(next_upper_call_wall, round(min_bull_strike, 2))
 
-    bear_cands = df[(df["strike"] < spot) & (df["strike"] >= spot * 0.88)].copy()
+    # 空頭破牆加空點 (bear_trigger)：至少低於現價 0.5%，若主力 Put 牆已跌破則對齊下方次級支撐牆
+    max_bear_strike = min(spot * 0.995, zero_gamma if is_pos_gamma else spot * 0.995)
+    bear_cands = df[(df["strike"] <= max_bear_strike) & (df["strike"] >= spot * 0.86)].copy()
     if not bear_cands.empty:
         bear_cands["cr_score"] = np.abs(bear_cands["put_gex_m"]) * (
             1.0 + bear_cands["put_vol_oi"]
         )
         bear_trigger = float(bear_cands.loc[bear_cands["cr_score"].idxmax(), "strike"])
     else:
-        bear_trigger = put_wall
+        bear_trigger = min(next_lower_put_wall, round(max_bear_strike, 2))
 
     far_calls = df[df["strike"] > bull_trigger]
     if not far_calls.empty:
@@ -1326,43 +1339,137 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
 CFD_RATIO_CACHE: Dict[str, Tuple[float, float]] = {}
 
 
-def get_cfd_multiplier(etf_ticker: str, etf_spot: float) -> Tuple[str, float]:
+def get_cfd_multiplier(etf_ticker: str, etf_spot: float) -> Tuple[str, float, float]:
     """
-    將 QQQ 自動換算為 US100 (^NDX) 點位、GLD 自動換算為 XAUUSD (GC=F) 黃金點位、SPY 換算為 US500 (^GSPC) 點位。
+    將 QQQ 換算為 US100 點位、GLD 換算為 XAUUSD 黃金點位、SPY 換算為 US500 點位。
+    同時抓取盤後/期貨 (prepost=True) 最新價格以對齊 OANDA/MT5 17:00 ET 收盤與夜盤報價！
+    回傳: (cfd_name, strike_multiplier, latest_cfd_price)
     """
     tk_u = etf_ticker.upper()
     if tk_u not in {"QQQ", "GLD", "SPY"} or etf_spot <= 0:
-        return "", 1.0
+        return "", 1.0, etf_spot
 
     now_ts = time.time()
-    if tk_u in CFD_RATIO_CACHE and (now_ts - CFD_RATIO_CACHE[tk_u][0] < 900):
-        mult = CFD_RATIO_CACHE[tk_u][1]
+    if tk_u in CFD_RATIO_CACHE and (now_ts - CFD_RATIO_CACHE[tk_u][0] < 600):
+        mult, latest_cfd = CFD_RATIO_CACHE[tk_u][1], CFD_RATIO_CACHE[tk_u][2]
     else:
-        ref_map = {"QQQ": ("^NDX", 41.1004), "GLD": ("GC=F", 10.855), "SPY": ("^GSPC", 10.0238)}
+        ref_map = {"QQQ": ("^NDX", 41.1004), "GLD": ("GC=F", 10.928), "SPY": ("^GSPC", 10.0238)}
         yf_sym, default_mult = ref_map[tk_u]
         mult = default_mult
+        latest_cfd = etf_spot * mult
         try:
             import yfinance as yf
 
-            hist = yf.Ticker(yf_sym).history(period="5d", interval="1d")
-            if not hist.empty:
-                idx_close = float(hist["Close"].iloc[-1])
+            # 1. 先計算 16:00 ET 正規盤收盤之精確履約價換算比例 (Index_Close / ETF_Close)
+            hist_idx = yf.Ticker(yf_sym).history(period="5d", interval="1d")
+            if not hist_idx.empty:
+                idx_close = float(hist_idx["Close"].iloc[-1])
                 if idx_close > 0:
                     mult = idx_close / etf_spot
+                    latest_cfd = idx_close
+
+            # 2. 再抓含盤後 (16:00~17:00 ET / 夜盤 prepost=True) 之 ETF 最新成交價，反映 OANDA/MT5 盤後跳動
+            hist_post = yf.Ticker(tk_u).history(period="2d", interval="5m", prepost=True)
+            if not hist_post.empty:
+                etf_post_last = float(hist_post["Close"].iloc[-1])
+                if etf_post_last > 0:
+                    latest_cfd = etf_post_last * mult
         except Exception:
             pass
-        CFD_RATIO_CACHE[tk_u] = (now_ts, mult)
+        CFD_RATIO_CACHE[tk_u] = (now_ts, mult, latest_cfd)
 
     cfd_name = {"QQQ": "US100 (NDX)", "GLD": "XAUUSD (黃金)", "SPY": "US500 (SPX)"}[tk_u]
-    return cfd_name, mult
+    return cfd_name, mult, latest_cfd
 
 
-def classify_tactical_verdict(s: WarRoomSnapshot, mult: float = 1.0) -> Tuple[str, str, Dict[str, float]]:
+def detect_special_gex_anomalies(s: WarRoomSnapshot, mult: float = 1.0) -> List[str]:
+    """
+    自動偵測 6 大期權籌碼特殊結構 (Special GEX Anomalies)，並在操作判定與交易計畫中特別說明：
+    1. 倒置型買 Call 逼空負 Gamma (負 Gamma 但翻轉點在現價下方，如暴漲股 LUNR)
+    2. 倒置型底部賣 Put 護盤正 Gamma (正 Gamma 但翻轉點在現價上方)
+    3. Max Pain 籌碼滯後牽引 (Max Pain 落在 Put 牆下方或 Call 牆上方，短期暴漲暴跌後遺症)
+    4. Gamma Pinning 磁吸釘住效應 (正 Gamma 且現價緊貼主力牆 <= 0.6% 或上下牆極窄)
+    5. 破牆 Gamma 真空互換區 (現價已跌破主力 Put 牆或已突破主力 Call 牆)
+    6. 臨近結算 Charm 尾盤解構窗 (DTE <= 1.5 天，造市商尾盤集中平倉避險部位)
+    """
+    notes: List[str] = []
+    spot = s.spot_price * mult
+    flip = s.zero_gamma_flip * mult
+    pw = s.put_wall * mult
+    cw = s.call_wall * mult
+    mp = s.max_pain * mult
+    next_pw = s.next_lower_put_wall * mult
+    next_cw = s.next_upper_call_wall * mult
+    fmt = ".0f" if mult > 5.0 else ".1f"
+
+    # 特殊狀況 1：負 Gamma 但翻轉點在現價下方 (倒置型買 Call 逼空負 Gamma)
+    if (not s.is_positive_gamma) and (s.zero_gamma_flip < s.spot_price * 0.995):
+        notes.append(
+            f"🔥【倒置型買 Call 逼空負 Gamma（翻轉點 ${flip:{fmt}} 在現價下方）】：此處並非跌破支撐走空，而是市場在上方高履約價搶買高 IV Call，"
+            f"使造市商在高價區背負 Short Call 負 Gamma！股價是因為「向上衝過翻轉點 ${flip:{fmt}}」才進入造市商被迫追買的軋空加速區；"
+            f"只要守穩翻轉點 ${flip:{fmt}} 與支撐牆 ${pw:{fmt}} 之上皆屬多頭逼空控盤，跌回 ${flip:{fmt}} 下方才會退回正 Gamma 盤整。"
+        )
+
+    # 特殊狀況 2：正 Gamma 但翻轉點在現價上方 (底部賣 Put 護盤型正 Gamma)
+    if s.is_positive_gamma and (s.zero_gamma_flip > s.spot_price * 1.005):
+        notes.append(
+            f"🛡️【倒置型底部賣 Put 護盤正 Gamma（翻轉點 ${flip:{fmt}} 在現價上方）】：機構在下方大舉賣出 Put 收租使下檔呈現正 Gamma 強力護盤，"
+            f"急跌皆有造市商低接買盤撐底；但若向上突破翻轉點 ${flip:{fmt}} 反而會進入上方買方主導的高波動加速區。"
+        )
+
+    # 特殊狀況 3：Max Pain 落在 Put 牆下方或 Call 牆上方 (暴漲暴跌後的籌碼滯後效應)
+    if s.max_pain < min(s.put_wall, s.spot_price * 0.96):
+        notes.append(
+            f"🧲【Max Pain 籌碼滯後下拽（痛點 ${mp:{fmt}} 低於 Put 牆 ${pw:{fmt}}）】：因近期股價急漲，當下短線 Put 牆雖已上移至 ${pw:{fmt}}，"
+            f"但歷史累積最多未平倉口數的結算痛點仍留在下方 ${mp:{fmt}}；一旦短線跌破 Put 牆 ${pw:{fmt}}，期權賣方磁吸力會加速將價格往痛點 ${mp:{fmt}} 壓回。"
+        )
+    elif s.max_pain > max(s.call_wall, s.spot_price * 1.04):
+        notes.append(
+            f"🧲【Max Pain 籌碼滯後上吸（痛點 ${mp:{fmt}} 高於 Call 牆 ${cw:{fmt}}）】：因近期股價急跌，短線 Call 壓力雖下移至 ${cw:{fmt}}，"
+            f"但歷史最大未平倉痛點仍留在上方 ${mp:{fmt}}；只要帶量站上 Call 牆 ${cw:{fmt}}，極易觸發往痛點 ${mp:{fmt}} 回歸的強勁反彈。"
+        )
+
+    # 特殊狀況 4：Gamma Pinning 磁吸釘住效應 (正 Gamma 且緊貼大牆或區間極窄)
+    if s.is_positive_gamma and (
+        abs(s.spot_price - s.call_wall) / max(s.spot_price, 0.01) <= 0.006
+        or abs(s.spot_price - s.put_wall) / max(s.spot_price, 0.01) <= 0.006
+        or abs(s.call_wall - s.put_wall) / max(s.spot_price, 0.01) <= 0.012
+    ):
+        notes.append(
+            f"📌【Gamma Pinning 磁吸釘住效應】：現價緊貼正 Gamma 最大籌碼牆，造市商雙向微幅高拋低吸將波動率鎖死（絞肉機盤勢），"
+            f"買方期權易遭時間價值（Theta）嚴重磨損，突破單易遭雙巴，建議以極短線區間高出低進或觀望為主。"
+        )
+
+    # 特殊狀況 5：破牆 Gamma 真空與支撐壓力互換
+    if s.put_wall > s.spot_price * 1.002:
+        notes.append(
+            f"🌪️【跌破主力 Put 牆（支撐轉反壓 + 負 Gamma 真空）】：原全場最大 Put 支撐牆 (${pw:{fmt}}) 已被跌穿並轉為上方蓋頭反壓！"
+            f"在重新站回 ${pw:{fmt}} 前反彈皆視為逃命波，下檔防守直接退守次級 Put 支撐牆 ${next_pw:{fmt}}。"
+        )
+    elif s.call_wall < s.spot_price * 0.998:
+        notes.append(
+            f"🌪️【穿破主力 Call 牆（壓力轉鐵板支撐 + 軋空真空）】：原全場最大 Call 壓力牆 (${cw:{fmt}}) 已被帶量攻克並轉為下方強力支撐！"
+            f"回測 ${cw:{fmt}} 不破皆偏多操作，上檔目標推升至次級 Call 壓力牆 ${next_cw:{fmt}}。"
+        )
+
+    # 特殊狀況 6：臨近結算日 Charm 尾盤倒貨時間窗
+    if s.dte_days <= 1.5:
+        notes.append(
+            f"⏰【臨近結算 Charm 尾盤解構警戒（僅餘 {s.dte_days:.1f} DTE）】：距離主力合約到期極近，價外期權 Delta 將隨時間快速歸零，"
+            f"造市商將於尾盤平倉窗（{s.charm_unwind_time_tw}）大量了結避險現貨，順勢部位務必於尾盤前主動落袋，切勿留倉賭結算。"
+        )
+
+    return notes
+
+
+def classify_tactical_verdict(
+    s: WarRoomSnapshot, mult: float = 1.0, override_spot: Optional[float] = None
+) -> Tuple[str, str, Dict[str, float]]:
     """
     明確判別當前屬於【🟢 做多】、【🔴 做空】、【🟡 盤整區間操作】或【⚪ 空手觀察】，
     並回傳換算後的關鍵作戰點位：盤整上下緣、多頭起漲點➔多單衰竭平倉點、跌破加空點➔空單回補平倉點。
     """
-    spot = s.spot_price * mult
+    spot = override_spot if (override_spot is not None and override_spot > 0) else (s.spot_price * mult)
     flip = s.zero_gamma_flip * mult
     pw = s.put_wall * mult
     cw = s.call_wall * mult
@@ -1407,17 +1514,24 @@ def classify_tactical_verdict(s: WarRoomSnapshot, mult: float = 1.0) -> Tuple[st
         return verdict, reason, levels
 
     if not s.is_positive_gamma:
+        is_inverted_call_squeeze = s.zero_gamma_flip < s.spot_price * 0.995
         if spot <= bear_start or s.put_wall > s.spot_price:
             verdict = "🔴 【順勢做空】（跌破支撐牆觸發負 Gamma 助跌）"
             reason = (
-                f"現價 (${spot:.1f}) 已跌破關鍵防線 (${bear_start:.1f}) 且處於翻轉點 (${flip:.1f}) 下方之負 Gamma 助跌區，"
+                f"現價 (${spot:.1f}) 已跌破關鍵防線 (${bear_start:.1f}) 處於負 Gamma 助跌區，"
                 f"造市商被迫順勢拋售避險；反彈不破 ${bear_start:.1f} 偏空操作，空單跌至 ${bear_tp_exhaust:.1f} 建議分批平倉回補。"
             )
         elif spot >= bull_start:
-            verdict = "🟢 【順勢做多】（帶量突破負 Gamma 軋空起漲點）"
+            verdict = "🟢 【順勢做多】（突破負 Gamma 軋空起漲點）"
             reason = (
                 f"現價 (${spot:.1f}) 已攻克軋空起漲點 (${bull_start:.1f})，造市商負 Gamma 被迫追買助漲；"
-                f"順勢做多並以 ${flip:.1f} 為防守停損，漲至衰竭點 ${bull_tp_exhaust:.1f} 建議獲利平倉。"
+                f"順勢做多並以 ${max(bear_start, flip):.1f} 為防守停損，漲至衰竭點 ${bull_tp_exhaust:.1f} 建議獲利平倉。"
+            )
+        elif is_inverted_call_squeeze:
+            verdict = "🟢 【偏多待突破 / 逼空蓄勢】（倒置型買 Call 負 Gamma：翻轉點在現價下方）"
+            reason = (
+                f"雖呈負 Gamma，但翻轉點 (${flip:.1f}) 在現價下方！代表股價已衝入上方買 Call 逼空區；"
+                f"守穩 Put 牆 ${pw:.1f} 可偏多操作或等突破起漲點 ${bull_start:.1f} 加碼追軋空（目標 ${bull_tp_exhaust:.1f}），若跌破 ${pw:.1f} 則停損防回測痛點 ${mp:.1f}。"
             )
         else:
             verdict = "⚪ 【空手觀察】（負 Gamma 中間夾縫區，等待突破起漲點或跌破加空點）"
@@ -1450,10 +1564,10 @@ def classify_tactical_verdict(s: WarRoomSnapshot, mult: float = 1.0) -> Tuple[st
 
 
 def format_cfd_mapping_line(s: WarRoomSnapshot, html_mode: bool = False) -> str:
-    cfd_name, mult = get_cfd_multiplier(s.ticker, s.spot_price)
+    cfd_name, mult, latest_cfd = get_cfd_multiplier(s.ticker, s.spot_price)
     if not cfd_name:
         return ""
-    verdict, _, lv = classify_tactical_verdict(s, mult)
+    verdict, _, lv = classify_tactical_verdict(s, mult, latest_cfd)
     if html_mode:
         return (
             f"<div style=\"background-color:#1E2638;border-radius:6px;padding:7px 9px;margin-top:4px;font-size:13px;border-left:3px solid #FFD54F;\">"
@@ -1479,18 +1593,22 @@ def format_cfd_mapping_line(s: WarRoomSnapshot, html_mode: bool = False) -> str:
 
 def build_stock_action_advice(s: WarRoomSnapshot) -> str:
     """
-    對所有 18 檔核心股輸出統一結構的「四選一判定 (做多/做空/盤整區間/空手觀察) + 起漲/衰竭/加空/平倉點位」。
+    對所有 18 檔核心股輸出統一結構的「四選一判定 + 起漲/衰竭/加空/平倉點位 + 6大特殊籌碼結構診斷」。
     """
-    cfd_name, mult = get_cfd_multiplier(s.ticker, s.spot_price)
-    verdict, reason, lv = classify_tactical_verdict(s, mult)
+    cfd_name, mult, latest_cfd = get_cfd_multiplier(s.ticker, s.spot_price)
+    verdict, reason, lv = classify_tactical_verdict(s, mult, latest_cfd)
+    anomalies = detect_special_gex_anomalies(s, mult)
     unit_prefix = f"[{cfd_name}] " if cfd_name else ""
     fmt = ".0f" if mult > 5.0 else ".1f"
-    return (
+    base_txt = (
         f"{unit_prefix}{verdict} — {reason} "
         f"（📌 盤整區間：${lv['range_low']:{fmt}}~${lv['range_high']:{fmt}} ｜ "
         f"🚀 漲破 ${lv['bull_start']:{fmt}} 起漲 ➔ ${lv['bull_tp']:{fmt}} 衰竭平倉 ｜ "
         f"🩸 跌破 ${lv['bear_start']:{fmt}} 加空 ➔ ${lv['bear_tp']:{fmt}} 空單平倉）"
     )
+    if anomalies:
+        return base_txt + " ｜ " + " ； ".join(anomalies)
+    return base_txt
 
 
 def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> Dict:
@@ -1563,6 +1681,20 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
             f"1. 【大盤與 US100 指數結論】：QQQ 目前位於翻轉點 {qqq_flip_str} 下方，Put 牆狀態為 {qqq_put_str}；在站回翻轉點前指數波動劇烈，嚴禁在跌破次級支撐時逆勢摸底接刀，須等站回翻轉點或突破軋空啟動價再順勢做多。\n"
             f"2. 【半導體與負 Gamma 警戒組（{', '.join(neg_list)}）】：目前受費半與大盤負 Gamma 拖累，未站回翻轉點前避免左側接刀，提防跌破 Put 牆後往空頭衰竭目標加速。\n"
             f"3. 【正 Gamma 護盤低接組（{', '.join(pos_list)}）】：具有造市商低接買盤保護，急殺回測各自 Put 支撐牆且未跌破時為最佳右側低接標的，反彈至 Call 牆即獲利了結。"
+        )
+    elif qqq_pos and pos_count < 6:
+        overall_badge = "🟠 指數正 Gamma 撐盤 vs. 多數權重股負 Gamma 轉弱（拉指數掩護個股調節之背離盤）"
+        inst_behavior = (
+            f"法人在指數 ETF 端維持 QQQ ({qqq_gex:+.1f}M) 正 Gamma 撐住大盤表面點位，"
+            f"但前十大權重股已有 {neg_count}/10 檔（{', '.join(neg_list)}）轉為負 Gamma（合計 {total_ndx_gex:+.1f}M）；費半 {smh_status_str}{tsm_status_str}。"
+        )
+        mm_mechanism = (
+            f"造市商在 QQQ 指數端雖有正 Gamma 減震買盤讓指數看似抗跌，但在多數權重個股（{', '.join(neg_list)}）已轉為 Short Gamma 順勢助跌；"
+            f"一旦這批負 Gamma 權重股帶量跌破各自 Put 牆，將會把 QQQ 往下拽破翻轉點 {qqq_flip_str}，形成補跌。"
+        )
+        conclusion_plan = (
+            f"1. 【大盤與 US100 指數結論】：切勿被指數表面抗跌麻痺，嚴密盯防 QQQ 翻轉點 {qqq_flip_str} 是否失守。\n"
+            f"2. 【個股操作結論】：避開已轉負 Gamma 之弱勢權重股（{', '.join(neg_list)}），僅可短線操作仍守住正 Gamma 之少數強勢股（{', '.join(pos_list) or '無'}）。"
         )
     else:
         overall_badge = "🔴 納指與權重股全面負 Gamma 助跌警戒（造市商追高殺低、提防破牆連鎖宣洩）"
