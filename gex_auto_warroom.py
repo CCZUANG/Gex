@@ -1750,6 +1750,46 @@ def format_clean_3line_stock_brief(s: WarRoomSnapshot) -> str:
     return f"{line1}\n{line2}\n{line3}\n{line4}"
 
 
+def split_telegram_message_chunks(text: str, max_len: int = 3400) -> List[str]:
+    """
+    Telegram 單則訊息上限為 4,096 字元；當 18 檔早報含完整操作建議與特殊結構說明超過 3,400 字元時，
+    自動依段落 (\n\n) 或換行 (\n) 智慧切分為多則連續訊息發送，絕不截斷單一股票卡片，也絕不報 message is too long 錯誤！
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: List[str] = []
+    blocks = text.split("\n\n")
+    curr = ""
+
+    for blk in blocks:
+        candidate = f"{curr}\n\n{blk}" if curr else blk
+        if len(candidate) <= max_len:
+            curr = candidate
+        else:
+            if curr:
+                chunks.append(curr)
+                curr = ""
+            if len(blk) <= max_len:
+                curr = blk
+            else:
+                for line in blk.split("\n"):
+                    cand_line = f"{curr}\n{line}" if curr else line
+                    if len(cand_line) <= max_len:
+                        curr = cand_line
+                    else:
+                        if curr:
+                            chunks.append(curr)
+                        curr = line[:max_len]
+    if curr:
+        chunks.append(curr)
+
+    total = len(chunks)
+    if total > 1:
+        return [f"📄 *【分段 {i+1}/{total}】*\n{c}" for i, c in enumerate(chunks)]
+    return chunks
+
+
 def send_telegram_alert_with_detail(
     bot_token: str,
     chat_id: str,
@@ -1773,7 +1813,7 @@ def send_telegram_alert_with_detail(
             url_photo = f"https://api.telegram.org/bot{clean_tok}/sendPhoto"
             short_cap = (
                 f"📊 {os.path.basename(image_path)} — 完整期權 GEX 日K點位請見下方戰情卡"
-                if len(message_md) > 900
+                if len(message_md) > 850
                 else message_md
             )
             with open(image_path, "rb") as img_f:
@@ -1784,34 +1824,39 @@ def send_telegram_alert_with_detail(
                 )
             if r_img.status_code != 200:
                 return False, f"sendPhoto HTTP {r_img.status_code}: {r_img.text[:160]}"
-            if len(message_md) <= 900:
+            if len(message_md) <= 850:
                 return True, "圖文單則推播成功"
 
         url_msg = f"https://api.telegram.org/bot{clean_tok}/sendMessage"
-        r_txt = _post_tg(
-            url_msg,
-            {
-                "chat_id": clean_cid,
-                "text": message_md,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": "true",
-            },
-        )
-        if r_txt.status_code == 200:
-            return True, "推播成功"
+        chunks = split_telegram_message_chunks(message_md, max_len=3400)
+        for idx, chunk_txt in enumerate(chunks):
+            r_txt = _post_tg(
+                url_msg,
+                {
+                    "chat_id": clean_cid,
+                    "text": chunk_txt,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": "true",
+                },
+            )
+            if r_txt.status_code != 200:
+                plain_text = chunk_txt.replace("*", "").replace("`", "")
+                r_plain = _post_tg(
+                    url_msg,
+                    {
+                        "chat_id": clean_cid,
+                        "text": plain_text,
+                        "disable_web_page_preview": "true",
+                    },
+                )
+                if r_plain.status_code != 200:
+                    return False, f"分段 {idx+1}/{len(chunks)} HTTP {r_plain.status_code}: {r_plain.text[:180]}"
+            if idx + 1 < len(chunks):
+                time.sleep(0.35)
 
-        plain_text = message_md.replace("*", "").replace("`", "")
-        r_plain = _post_tg(
-            url_msg,
-            {
-                "chat_id": clean_cid,
-                "text": plain_text,
-                "disable_web_page_preview": "true",
-            },
-        )
-        if r_plain.status_code == 200:
-            return True, "推播成功 (純文字模式)"
-        return False, f"HTTP {r_plain.status_code}: {r_plain.text[:180]}"
+        if len(chunks) > 1:
+            return True, f"推播成功 (共自動切分為 {len(chunks)} 則連續訊息)"
+        return True, "推播成功"
     except Exception as exc:
         return False, f"網路連線異常: {exc}"
 
@@ -2846,7 +2891,7 @@ def run_streamlit_warroom() -> None:
         )
 
         # 【圖表 2：獨立滿版各履約價 Net GEX 柱狀圖 (上下分開排列，手機清楚好讀)】
-        df_sub_gex = df_gex[(df_gex["strike"] >= y_min) & (df_gex["strike"] <= y_max)].copy()
+        df_sub_gex = df_gex[(df_gex["strike"] >= snap.spot_price * 0.82) & (df_gex["strike"] <= snap.spot_price * 1.18)].copy()
         bar_colors = ["#00E676" if v >= 0 else "#FF1744" for v in df_sub_gex["net_gex_m"]]
         fig_gex = go.Figure()
         fig_gex.add_trace(
