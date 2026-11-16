@@ -597,12 +597,20 @@ def dealer_call_polarity(
       只要 Vol/OI >= 0.80 且呈現 Call Skew (call_iv >= put_iv) 或 IV >= 25%，即判定造市商為 Short Call Gamma (-1.0)。
     """
     vol_oi = call_vol / np.maximum(call_oi, 1.0)
+    # 若美股開盤前交易所將當日成交量 (call_vol) 歸零重置，則僅以高 IV 與 Skew 判定，避免開盤前極性突然翻轉
+    is_preopen_zero_vol = float(np.sum(call_vol)) <= 10.0
     tk_u = ticker.upper()
     if tk_u in {"GLD", "SLV", "GDX", "USO"}:
         if put_iv is not None:
             has_call_skew = call_iv >= put_iv * 0.99
+            if is_preopen_zero_vol:
+                return np.where(has_call_skew & (call_iv >= 0.25), -1.0, 1.0)
             return np.where((vol_oi >= 0.80) & (has_call_skew | (call_iv >= 0.25)), -1.0, 1.0)
         return np.where((vol_oi >= 0.80) & (call_iv >= 0.25), -1.0, 1.0)
+    if is_preopen_zero_vol:
+        if put_iv is not None:
+            return np.where((call_iv >= 0.65) & (call_iv >= put_iv * 1.02), -1.0, 1.0)
+        return np.where(call_iv >= 0.70, -1.0, 1.0)
     return np.where((vol_oi >= 0.85) & (call_iv >= 0.65), -1.0, 1.0)
 
 
@@ -945,9 +953,7 @@ def evaluate_snapshot_and_alerts(
         )
 
     is_iv_crushing = iv_drop_rel_pct >= iv_crush_drop_threshold_pct
-    is_price_exhausted = (high_curr >= bull_exhaust * 0.99) and (
-        upper_wick_ratio > 0.40 or vol_curr < vol_ma20
-    )
+    is_price_exhausted = (high_curr >= bull_exhaust * 0.995) and (upper_wick_ratio > 0.45) and (spot > bull_trigger)
     if is_iv_crushing or is_price_exhausted:
         entry = round(spot, 2)
         tp = round(max(zero_gamma, max_pain), 2)
@@ -1299,8 +1305,17 @@ def format_streamlit_card_markdown(snap: WarRoomSnapshot) -> str:
 def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
     chg_pct = ((snap.spot_price - snap.prev_close) / max(snap.prev_close, 0.01)) * 100.0
     regime_emoji = "🟢 正 Gamma (高拋低吸 / 區間收斂)" if snap.is_positive_gamma else "🔴 負 Gamma (追高殺低 / 擠壓爆發)"
+    cfd_name, mult, latest_cfd = get_cfd_multiplier(snap.ticker, snap.spot_price)
+    verdict, reason, lv = classify_tactical_verdict(snap, mult, latest_cfd)
+    anomalies = detect_special_gex_anomalies(snap, mult)
+    fmt = ".0f" if mult > 5.0 else ".1f"
+
     lines = [
-        f"📡 *【{snap.ticker} 期權 GEX 日K戰情卡】*",
+        f"*{snap.ticker} 建議：{verdict}*",
+        f"💡 *建議操作*：{reason}",
+        f"🎯 *關鍵路線*：盤整 `${lv['range_low']:{fmt}}~${lv['range_high']:{fmt}}`｜🚀 漲過 `${lv['bull_start']:{fmt}}` 做多 ➔ `${lv['bull_tp']:{fmt}}` 平倉｜🩸 跌破 `${lv['bear_start']:{fmt}}` 加空 ➔ `${lv['bear_tp']:{fmt}}` 回補",
+        "",
+        f"📡 *【{snap.ticker} 期權 GEX 數據明細】*",
         f"• 分析時間：`{snap.timestamp_tw}`",
         f"• 期權樣本：`{snap.expiration_date}`",
         f"• 最新日K：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`) [Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
@@ -1326,6 +1341,11 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
         f"• ATM IV 狀態：`{snap.atm_iv_pct:.1f}%` (峰值 `{snap.iv_peak_pct:.1f}%` / 回落 `{snap.iv_drop_from_peak_pct:.1f}%`)",
         f"• Charm 平倉窗：`{snap.charm_unwind_time_tw}`",
     ]
+    if anomalies:
+        lines.append("")
+        lines.append("🔍 *【特殊籌碼結構提醒】*")
+        for an in anomalies:
+            lines.append(f"• {an}")
     if snap.active_alerts:
         lines.append("")
         for a in snap.active_alerts:
@@ -1617,8 +1637,7 @@ def build_stock_action_advice(s: WarRoomSnapshot) -> str:
 
 def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> Dict:
     """
-    結合 SPY/QQQ/SMH/SOXX/GLD 四大指數 ETF 與納斯達克前十大權重股 (及 TSM)，
-    深入解析「法人期權佈局邏輯」、「造市商動態對沖機制」與「整體實戰分析結論」。
+    精簡高密度版總體 Gamma 分析：消除冗長文字與分類矛盾（TSM 依自身正負 Gamma 自動歸隊，不混入反方括號）。
     """
     ndx_snaps = [scanned_map[tk] for tk in NASDAQ_TOP10_TICKERS if tk in scanned_map]
     qqq_snap = scanned_map.get("QQQ")
@@ -1634,83 +1653,60 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
     total_ndx_gex = sum(s.net_gex_millions for s in ndx_snaps)
     above_flip_count = sum(1 for s in ndx_snaps if s.spot_price >= s.zero_gamma_flip)
 
+    # 將 TSM 依自身實際正負 Gamma 放入對應操作分組，絕不張冠李戴
+    pos_group = list(pos_list)
+    neg_group = list(neg_list)
+    if tsm_snap:
+        if tsm_snap.is_positive_gamma and "TSM" not in pos_group:
+            pos_group.append("TSM")
+        elif (not tsm_snap.is_positive_gamma) and "TSM" not in neg_group:
+            neg_group.append("TSM")
+
     qqq_pos = qqq_snap.is_positive_gamma if qqq_snap else (pos_count >= 5)
     qqq_gex = qqq_snap.net_gex_millions if qqq_snap else total_ndx_gex
     spy_gex = spy_snap.net_gex_millions if spy_snap else 0.0
     smh_gex = smh_snap.net_gex_millions if smh_snap else 0.0
     soxx_gex = soxx_snap.net_gex_millions if soxx_snap else 0.0
 
-    qqq_flip_str = f"${qqq_snap.zero_gamma_flip:.2f} (約合 NDX/US100 {qqq_snap.zero_gamma_flip * 41.10:.0f} 點)" if qqq_snap else "N/A"
+    qqq_flip_str = f"${qqq_snap.zero_gamma_flip:.2f} (US100 約 {qqq_snap.zero_gamma_flip * 41.10:.0f})" if qqq_snap else "N/A"
     qqq_put_str = (
-        f"${qqq_snap.put_wall:.1f} (已跌破，次級支撐 ${qqq_snap.next_lower_put_wall:.1f} / 破牆助跌目標 ${qqq_snap.bear_exhaustion_price:.1f})"
+        f"${qqq_snap.put_wall:.1f} (已破/次撐 ${qqq_snap.next_lower_put_wall:.1f})"
         if (qqq_snap and qqq_snap.put_wall > qqq_snap.spot_price)
         else (f"${qqq_snap.put_wall:.1f}" if qqq_snap else "N/A")
     )
-    smh_status_str = (
-        f"SMH (${smh_snap.spot_price:.2f} / {'正Gamma' if smh_snap.is_positive_gamma else '負Gamma'} {smh_gex:+.1f}M / 翻轉點 ${smh_snap.zero_gamma_flip:.2f})"
-        if smh_snap
-        else "SMH 載入中"
-    )
-    tsm_status_str = (
-        f"、TSM (${tsm_snap.spot_price:.2f} / {'🟢正Gamma' if tsm_snap.is_positive_gamma else '🔴負Gamma'} {tsm_snap.net_gex_millions:+.1f}M)"
-        if tsm_snap
-        else ""
-    )
 
     if qqq_pos and pos_count >= 6:
-        overall_badge = "🟢 納指與權重股全面正 Gamma 共振（造市商逢低護盤、偏多震盪墊高）"
-        inst_behavior = (
-            f"法人在 QQQ ({qqq_gex:+.1f}M) 與前十大權重股（{pos_count}/10 檔正 Gamma，合計 {total_ndx_gex:+.1f}M）"
-            f"皆以賣出 Call 收租或偏多部位為主，未出現恐慌性指數買 Put 避險；費半 {smh_status_str}{tsm_status_str}。"
-        )
-        mm_mechanism = (
-            "造市商在指數與個股雙端皆處於「Long Gamma（跌買漲賣）」減震模式：盤中任何回檔接近 Put 支撐牆都會觸發造市商自動買進現貨與期貨護盤，波動率收斂、下檔支撐極強。"
-        )
+        overall_badge = "🟢 納指與權重全面正 Gamma（造市商逢低護盤、偏多震盪）"
+        inst_behavior = f"法人於 QQQ ({qqq_gex:+.0f}M) 與 {pos_count}/10 檔權重股皆採賣 Call 收租或偏多佈局。"
+        mm_mechanism = "指數與個股雙端皆為「跌買漲賣」減震護盤，回測 Put 支撐牆易有買盤承接。"
         conclusion_plan = (
-            f"1. 【大盤與費半方向】：只要 QQQ 守穩翻轉點 {qqq_flip_str} 之上，維持拉回偏多思維，不追高、逢回測 Put 牆 ({qqq_put_str}) 分批低接。\n"
-            f"2. 【個股首選】：優先操作正 Gamma 強勢護盤股（{', '.join(pos_list)}），於回測各自 Put 支撐牆時進場，接近 Call 牆分批獲利。"
+            f"1. 【指數結論】：QQQ 守穩翻轉點 {qqq_flip_str} 偏多操作，回測 Put 牆 {qqq_put_str} 低接。\n"
+            f"2. 【個股分組】：優先低接 🟢 正 Gamma 護盤組（{', '.join(pos_group) or '無'}）；避開 🔴 負 Gamma 組（{', '.join(neg_group) or '無'}）。"
         )
     elif (not qqq_pos) and pos_count >= 5:
-        overall_badge = "🟡 指數負 Gamma 避險 vs. 權重股正 Gamma 護盤（機構買大盤保險、個股抗跌之高波動拉扯盤）"
-        inst_behavior = (
-            f"華爾街法人並未大舉拋售科技巨頭現貨（前十大權重股有 {pos_count} 檔維持正 Gamma：{', '.join(pos_list)}，合計 {total_ndx_gex:+.1f}M），"
-            f"但法人為了對沖總體事件風險，集中在指數 ETF 大舉買進保護性 Put，導致 SPY ({spy_gex:+.1f}M)、QQQ ({qqq_gex:+.1f}M) 與費半 {smh_status_str} 呈現深負 Gamma；"
-            f"僅半導體與部分高 Beta 股（{', '.join(neg_list)}{tsm_status_str}）落入負 Gamma。"
-        )
-        mm_mechanism = (
-            f"造市商面臨「指數端 Short Gamma 助跌 vs. 個股端 Long Gamma 護盤」的雙向拉扯：當大盤微幅轉弱時，造市商在 QQQ/SPY 與半導體 ({', '.join(neg_list)}) 被迫順勢拋售期貨助跌，容易引發盤中急殺；"
-            f"但當急殺把 {pos_count} 檔正 Gamma 權重股拖向各自的 Put 支撐牆時，個股端造市商又會逆勢逢低大買現貨護盤，形成「指數急殺容易V轉彈回、上下影線極長」的雙巴震盪格局。"
-        )
+        overall_badge = "🟡 指數負 Gamma 避險 vs. 權重正 Gamma 護盤（急殺易拉回之震盪盤）"
+        inst_behavior = f"法人集中在指數 ETF 買 Put 避險（SPY {spy_gex:+.0f}M / QQQ {qqq_gex:+.0f}M / SMH {smh_gex:+.0f}M），但 {pos_count}/10 檔權重股仍維持正 Gamma ({total_ndx_gex:+.0f}M)。"
+        mm_mechanism = "指數端造市商「順勢追空」易帶動急殺，但跌至個股 Put 牆時，正 Gamma 權重股造市商會「逆勢買進護盤」，形成急殺留長下影線的拉扯盤。"
         conclusion_plan = (
-            f"1. 【大盤與 US100 指數結論】：QQQ 目前位於翻轉點 {qqq_flip_str} 下方，Put 牆狀態為 {qqq_put_str}；在站回翻轉點前指數波動劇烈，嚴禁在跌破次級支撐時逆勢摸底接刀，須等站回翻轉點或突破軋空啟動價再順勢做多。\n"
-            f"2. 【半導體與負 Gamma 警戒組（{', '.join(neg_list)}）】：目前受費半與大盤負 Gamma 拖累，未站回翻轉點前避免左側接刀，提防跌破 Put 牆後往空頭衰竭目標加速。\n"
-            f"3. 【正 Gamma 護盤低接組（{', '.join(pos_list)}）】：具有造市商低接買盤保護，急殺回測各自 Put 支撐牆且未跌破時為最佳右側低接標的，反彈至 Call 牆即獲利了結。"
+            f"1. 【指數結論】：QQQ 位於翻轉點 {qqq_flip_str} 下方（Put 牆 {qqq_put_str}），站回翻轉點前勿盲目摸底，突破起漲點再追多。\n"
+            f"2. 【🟢 正 Gamma 低接組】：{', '.join(pos_group) or '無'}（回測各自 Put 牆守穩可低接，近 Call 牆平倉）。\n"
+            f"3. 【🔴 負 Gamma 警戒組】：{', '.join(neg_group) or '無'}（造市商順勢助跌，跌破 Put 牆嚴禁接刀）。"
         )
     elif qqq_pos and pos_count < 6:
-        overall_badge = "🟠 指數正 Gamma 撐盤 vs. 多數權重股負 Gamma 轉弱（拉指數掩護個股調節之背離盤）"
-        inst_behavior = (
-            f"法人在指數 ETF 端維持 QQQ ({qqq_gex:+.1f}M) 正 Gamma 撐住大盤表面點位，"
-            f"但前十大權重股已有 {neg_count}/10 檔（{', '.join(neg_list)}）轉為負 Gamma（合計 {total_ndx_gex:+.1f}M）；費半 {smh_status_str}{tsm_status_str}。"
-        )
-        mm_mechanism = (
-            f"造市商在 QQQ 指數端雖有正 Gamma 減震買盤讓指數看似抗跌，但在多數權重個股（{', '.join(neg_list)}）已轉為 Short Gamma 順勢助跌；"
-            f"一旦這批負 Gamma 權重股帶量跌破各自 Put 牆，將會把 QQQ 往下拽破翻轉點 {qqq_flip_str}，形成補跌。"
-        )
+        overall_badge = "🟠 指數正 Gamma 撐盤 vs. 權重負 Gamma 轉弱（拉指數出個股背離盤）"
+        inst_behavior = f"QQQ ({qqq_gex:+.0f}M) 雖維持正 Gamma，但已有 {neg_count}/10 檔權重股轉為負 Gamma ({total_ndx_gex:+.0f}M)。"
+        mm_mechanism = "指數表面抗跌，但多數權重股已失去造市商低接護盤，提防個股破牆拖累指數補跌。"
         conclusion_plan = (
-            f"1. 【大盤與 US100 指數結論】：切勿被指數表面抗跌麻痺，嚴密盯防 QQQ 翻轉點 {qqq_flip_str} 是否失守。\n"
-            f"2. 【個股操作結論】：避開已轉負 Gamma 之弱勢權重股（{', '.join(neg_list)}），僅可短線操作仍守住正 Gamma 之少數強勢股（{', '.join(pos_list) or '無'}）。"
+            f"1. 【指數結論】：嚴防 QQQ 跌破翻轉點 {qqq_flip_str} 轉空。\n"
+            f"2. 【個股分組】：避開 🔴 負 Gamma 轉弱組（{', '.join(neg_group) or '無'}）；僅短打 🟢 正 Gamma 組（{', '.join(pos_group) or '無'}）。"
         )
     else:
-        overall_badge = "🔴 納指與權重股全面負 Gamma 助跌警戒（造市商追高殺低、提防破牆連鎖宣洩）"
-        inst_behavior = (
-            f"法人在大盤 QQQ ({qqq_gex:+.1f}M)、SPY ({spy_gex:+.1f}M)、費半 {smh_status_str} 以及過半數權重股（{neg_count}/10 檔負 Gamma：{', '.join(neg_list)}，合計 {total_ndx_gex:+.1f}M）同步大買 Put 避險。"
-        )
-        mm_mechanism = (
-            "造市商在指數與權重股雙端皆處於「Short Gamma（跌賣漲買）」順勢放大波動模式：一旦跌破 Put 牆，造市商毫無低接護盤買盤，反而必須沿路追空期貨與現貨，極易走出單邊長黑或急跌後暴力嘎空的極端行情。"
-        )
+        overall_badge = "🔴 納指與權重全面負 Gamma 警戒（造市商追高殺低、嚴防破牆急殺）"
+        inst_behavior = f"法人於指數（QQQ {qqq_gex:+.0f}M / SPY {spy_gex:+.0f}M）與 {neg_count}/10 檔權重股同步大買 Put 避險。"
+        mm_mechanism = "指數與個股雙端皆處於「跌賣漲買」助跌模式，跌破 Put 牆將引發造市商連鎖拋售。"
         conclusion_plan = (
-            f"1. 【大盤與 US100 指數結論】：QQQ 需重新收復翻轉點 {qqq_flip_str} 才能解除助跌警報；若跌破 {qqq_put_str} 務必嚴格停損或順勢偏空。\n"
-            f"2. 【個股操作結論】：全面避開跌破 Put 牆之負 Gamma 股（{', '.join(neg_list)}），僅保留極少數正 Gamma 股（{', '.join(pos_list) or '無'}）或等帶量突破軋空啟動價再右側追擊。"
+            f"1. 【指數結論】：QQQ 未收復翻轉點 {qqq_flip_str} 前偏空看待，跌破 {qqq_put_str} 順勢做空或停損。\n"
+            f"2. 【個股分組】：全面避開 🔴 負 Gamma 破牆組（{', '.join(neg_group) or '無'}）；僅關注 🟢 正 Gamma 組（{', '.join(pos_group) or '無'}）。"
         )
 
     direction_summary = f"{inst_behavior} {mm_mechanism}"
@@ -1792,6 +1788,25 @@ def split_telegram_message_chunks(text: str, max_len: int = 3400) -> List[str]:
     if total > 1:
         return [f"📄 *【分段 {i+1}/{total}】*\n{c}" for i, c in enumerate(chunks)]
     return chunks
+
+
+def cleanup_legacy_alert_pngs() -> int:
+    """
+    自動清理 VPS 資料夾內累積的 *_bg_alert.png / *_tg_query.png / *_warroom_alert.png 暫存圖檔，
+    避免硬碟空間被舊圖塞爆。
+    """
+    removed = 0
+    try:
+        for fname in os.listdir(BASE_DIR):
+            if fname.endswith(("_bg_alert.png", "_tg_query.png", "_warroom_alert.png")):
+                try:
+                    os.remove(os.path.join(BASE_DIR, fname))
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
 
 
 def send_telegram_alert_with_detail(
@@ -1975,12 +1990,17 @@ def fetch_live_market_data(
             if df_e.empty:
                 continue
             exp_d_obj = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
-            raw_days = (exp_d_obj - today_dt).days
-            # 若為當日到期 (0 DTE) 且處於美股開盤前無有效報價時段，跳過該期避免 0.5 DTE 搭配歸零 IV 造成價平 Gamma 虛爆
-            if raw_days <= 0 and len(selected_exps) > 1:
+            now_utc_dt = datetime.datetime.now(datetime.timezone.utc)
+            # 美股期權於到期日美東 16:00 (21:00 UTC，即台灣時間隔日凌晨 05:00) 才正式到期結算！
+            # 在結算前，當日到期合約 (如週一 11/16 合約) 仍為場上最大 Gamma 主力，絕不可提前丟棄！
+            exp_close_utc = datetime.datetime(
+                exp_d_obj.year, exp_d_obj.month, exp_d_obj.day, 21, 0, tzinfo=datetime.timezone.utc
+            )
+            rem_hours = (exp_close_utc - now_utc_dt).total_seconds() / 3600.0
+            if rem_hours <= -2.0 and len(selected_exps) > 1:
                 continue
-            dte_e = max(float(raw_days), 1.0)
-            tte_e = max(dte_e / 365.0, 1.0 / 365.0)
+            dte_e = max(rem_hours / 24.0, 0.5)
+            tte_e = max(dte_e / 365.0, 1.0 / (365.0 * 24.0))
 
             # 盤前/休市 Yahoo Finance 常將部分履約價之 impliedVolatility 重置為 0.00001；
             # 自動以 20 日歷史波動率 (HV) 或有效中位數 IV 修復低於 8% 之異常歸零 IV！
@@ -2211,6 +2231,7 @@ class BackgroundPatrolDaemon:
         self._thread_patrol = threading.Thread(target=self._patrol_loop, daemon=True)
         self._thread_tg_cmd = threading.Thread(target=self._tg_command_loop, daemon=True)
         self._thread_mt5_req = threading.Thread(target=self._mt5_request_loop, daemon=True)
+        cleanup_legacy_alert_pngs()
         self._thread_patrol.start()
         self._thread_tg_cmd.start()
         self._thread_mt5_req.start()
@@ -2281,13 +2302,21 @@ class BackgroundPatrolDaemon:
                             + datetime.timedelta(hours=8)
                         ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
 
+                        cleanup_legacy_alert_pngs()
+                        core_set = set(MARKET_INDEX_TICKERS + core_list)
+                        non_core_hits = []
+
                         for snap, df_ohlcv, df_gex in results:
-                            if snap.active_alerts:
-                                top_code = snap.active_alerts[0].code
-                                if should_send_alert_with_cooldown(snap.ticker, top_code):
-                                    out_png = os.path.join(
-                                        BASE_DIR, f"{snap.ticker}_bg_alert.png"
-                                    )
+                            if not snap.active_alerts:
+                                continue
+                            top_code = snap.active_alerts[0].code
+                            if not should_send_alert_with_cooldown(snap.ticker, top_code):
+                                continue
+
+                            if snap.ticker.upper() in core_set:
+                                # 核心 18 檔：立即發送單股圖文警報，發完隨即刪除暫存圖檔不佔空間
+                                out_png = os.path.join(BASE_DIR, f"_tmp_{snap.ticker}_alert.png")
+                                try:
                                     render_warroom_chart_png(snap, df_ohlcv, df_gex, out_png)
                                     ok = send_telegram_alert(
                                         tg_token,
@@ -2297,6 +2326,35 @@ class BackgroundPatrolDaemon:
                                     )
                                     if ok:
                                         self.total_pushed += 1
+                                finally:
+                                    if os.path.exists(out_png):
+                                        try:
+                                            os.remove(out_png)
+                                        except Exception:
+                                            pass
+                            else:
+                                non_core_hits.append(snap)
+
+                        # 非核心全美股：精選最強前 5 名彙整為「1 則精選黑馬榜單」，徹底杜絕一次 100 封洗版！
+                        if non_core_hits:
+                            non_core_hits.sort(key=lambda s: abs(s.net_gex_millions), reverse=True)
+                            top5 = non_core_hits[:5]
+                            digest_lines = [
+                                f"🐎 *【全美股異動精選 Top {len(top5)} 榜單】*（本次共偵測 {len(non_core_hits)} 檔觸發，已自動濃縮防洗版）",
+                                f"時間：`{self.last_run_tw}`（輸入代號即可單獨看 K 線圖）",
+                                "",
+                            ]
+                            for sn_h in top5:
+                                v_h, _, lv_h = classify_tactical_verdict(sn_h, 1.0)
+                                a0 = sn_h.active_alerts[0]
+                                digest_lines.extend([
+                                    f"*{sn_h.ticker}* (`${sn_h.spot_price:.2f}`)｜{v_h}",
+                                    f"  • 訊號：{a0.title}",
+                                    f"  • 建議：進場 `${a0.entry_price:.2f}`｜停損 `${a0.sl_price:.2f}`｜目標 `${a0.tp_price:.2f}` (`RRR 1:{a0.rrr:.1f}`)",
+                                    "",
+                                ])
+                            if send_telegram_alert(tg_token, tg_chat_id, "\n".join(digest_lines)):
+                                self.total_pushed += 1
                     else:
                         self.last_run_tw = "非美股開盤時段自動待機中"
                 time.sleep(interval_sec)
@@ -2366,14 +2424,21 @@ class BackgroundPatrolDaemon:
                         )
                         if res is not None:
                             snap, df_ohlcv, df_gex = res
-                            out_png = os.path.join(BASE_DIR, f"{snap.ticker}_tg_query.png")
-                            render_warroom_chart_png(snap, df_ohlcv, df_gex, out_png)
-                            send_telegram_alert(
-                                tg_token,
-                                tg_chat_id,
-                                format_telegram_card_message(snap),
-                                out_png,
-                            )
+                            out_png = os.path.join(BASE_DIR, f"_tmp_{snap.ticker}_tg_query.png")
+                            try:
+                                render_warroom_chart_png(snap, df_ohlcv, df_gex, out_png)
+                                send_telegram_alert(
+                                    tg_token,
+                                    tg_chat_id,
+                                    format_telegram_card_message(snap),
+                                    out_png,
+                                )
+                            finally:
+                                if os.path.exists(out_png):
+                                    try:
+                                        os.remove(out_png)
+                                    except Exception:
+                                        pass
                         else:
                             send_telegram_alert(
                                 tg_token,
