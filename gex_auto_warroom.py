@@ -120,6 +120,27 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
         and "--morning" not in sys.argv
         and "--daemon-loop" not in sys.argv
     ):
+        # 若 Port 8501 被舊版 Streamlit 佔用，直接自動終止佔用 8501 的舊程序並釋放 Port 8501，絕不留幽靈程序也不換 Port！
+        if IS_WINDOWS_VPS:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_chk:
+                if s_chk.connect_ex(("127.0.0.1", 8501)) == 0:
+                    print("🧹 偵測到 Port 8501 被舊版網頁程序佔用，正在自動清理並釋放 Port 8501...")
+                    try:
+                        ps_free_8501 = (
+                            "Get-NetTCPConnection -LocalPort 8501 -ErrorAction SilentlyContinue "
+                            "| Select-Object -ExpandProperty OwningProcess -Unique "
+                            "| ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
+                        )
+                        subprocess.call(
+                            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_free_8501],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        import time as _t_wait
+                        _t_wait.sleep(1.0)
+                    except Exception:
+                        pass
+        chosen_port = 8501
         print("🚀 正在啟動 Windows VPS 全美股 GEX 戰情室與 24H 後台推播守護程序...")
         print("   • 本機設定網址: http://localhost:8501 (不需開放 VPS 防火牆)")
         script_path = os.path.abspath(__file__)
@@ -134,7 +155,7 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                     "--server.address",
                     "127.0.0.1",
                     "--server.port",
-                    "8501",
+                    str(chosen_port),
                 ]
             )
         )
@@ -1904,23 +1925,62 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
 
 def format_clean_3line_stock_brief(s: WarRoomSnapshot) -> str:
     """
-    清爽易讀的四行式早報卡片（含支撐壓力牆、啟動/衰竭價位與近期操作建議）
+    極簡兩行式手機早報卡片（每檔僅 ~100 字元，讓 18 檔早報壓縮在單則 Telegram 訊息內 30 秒看完）
     """
     chg_pct = ((s.spot_price - s.prev_close) / max(s.prev_close, 0.01)) * 100.0
-    light = "🟢 正Gamma" if s.is_positive_gamma else "🔴 負Gamma"
-    line1 = f"*{s.ticker}* (`${s.spot_price:.2f}` / `{chg_pct:+.2f}%`)｜{light} (`{s.net_gex_millions:+.1f}M`)｜翻轉點 `${s.zero_gamma_flip:.2f}`"
-    pw_tag = f"${s.put_wall:.1f}(⚠️已破/次撐${s.next_lower_put_wall:.1f})" if s.put_wall > s.spot_price else f"${s.put_wall:.1f}"
-    cw_tag = f"${s.call_wall:.1f}(🚀已破/次壓${s.next_upper_call_wall:.1f})" if s.call_wall < s.spot_price else f"${s.call_wall:.1f}"
-    line2 = f"  • 支撐壓力：Put牆 `{pw_tag}` ｜ 痛點 `${s.max_pain:.1f}` ｜ Call牆 `{cw_tag}`"
-    line3 = (
-        f"  • 啟動與衰竭：🚀 軋空啟動 `${s.bull_squeeze_trigger:.1f}` ➔ 衰竭 `${s.bull_exhaustion_price:.1f}` ｜ "
-        f"🩸 破牆啟動 `${s.bear_squeeze_trigger:.1f}` ➔ 空頭衰竭 `${s.bear_exhaustion_price:.1f}`"
+    light = "🟢" if s.is_positive_gamma else "🔴"
+    _, mult, latest_cfd = get_cfd_multiplier(s.ticker, s.spot_price)
+    verdict, _, lv = classify_tactical_verdict(s, 1.0)
+    short_v = verdict.split("（")[0].strip()
+    pw_s = f"${s.put_wall:.0f}(破/次${s.next_lower_put_wall:.0f})" if s.put_wall > s.spot_price else f"${s.put_wall:.0f}"
+    cw_s = f"${s.call_wall:.0f}(破/次${s.next_upper_call_wall:.0f})" if s.call_wall < s.spot_price else f"${s.call_wall:.0f}"
+
+    line1 = f"{light} *{s.ticker}* `${s.spot_price:.2f}` (`{chg_pct:+.1f}%`)｜`{s.net_gex_millions:+.0f}M`｜{short_v}"
+    line2 = f"  Put `{pw_s}` / 痛 `${s.max_pain:.0f}` / Call `{cw_s}`｜翻 `${s.zero_gamma_flip:.1f}`｜🚀`${s.bull_squeeze_trigger:.0f}` 🩸`${s.bear_squeeze_trigger:.0f}`"
+    return f"{line1}\n{line2}"
+
+
+def generate_tv_sync_code_string(scanned_map: Dict[str, WarRoomSnapshot]) -> str:
+    """
+    產生 TradingView 一鍵貼上同步碼（包含 US100、XAUUSD、US500 及全部 18 檔核心股）：
+    格式：SYM:PosFlag,Flip,PutWall,CallWall,MaxPain,BullStart,BullTP,BearStart,BearTP|...
+    """
+    segments: List[str] = []
+    # 1. 先輸出換算後的 US100、XAUUSD、US500 專屬點位
+    cfd_pairs = [("QQQ", "US100"), ("GLD", "XAUUSD"), ("SPY", "US500")]
+    for etf_k, tv_sym in cfd_pairs:
+        if etf_k in scanned_map:
+            sn = scanned_map[etf_k]
+            _, mult, latest_cfd = get_cfd_multiplier(etf_k, sn.spot_price)
+            _, _, lv = classify_tactical_verdict(sn, mult, latest_cfd)
+            pos_flag = 1 if sn.is_positive_gamma else 0
+            segments.append(
+                f"{tv_sym}:{pos_flag},{lv['flip']:.1f},{lv['range_low']:.1f},{lv['range_high']:.1f},"
+                f"{lv['mp']:.1f},{lv['bull_start']:.1f},{lv['bull_tp']:.1f},{lv['bear_start']:.1f},{lv['bear_tp']:.1f}"
+            )
+
+    # 2. 再輸出全部 18 檔 ETF 與個股原始點位
+    for tk_k, sn in scanned_map.items():
+        _, _, lv = classify_tactical_verdict(sn, 1.0)
+        pos_flag = 1 if sn.is_positive_gamma else 0
+        segments.append(
+            f"{tk_k.upper()}:{pos_flag},{lv['flip']:.2f},{lv['range_low']:.2f},{lv['range_high']:.2f},"
+            f"{lv['mp']:.2f},{lv['bull_start']:.2f},{lv['bull_tp']:.2f},{lv['bear_start']:.2f},{lv['bear_tp']:.2f}"
+        )
+
+    return "|".join(segments)
+
+
+def format_cfd_compact_morning_line(s: WarRoomSnapshot) -> str:
+    cfd_name, mult, latest_cfd = get_cfd_multiplier(s.ticker, s.spot_price)
+    if not cfd_name:
+        return ""
+    verdict, _, lv = classify_tactical_verdict(s, mult, latest_cfd)
+    short_v = verdict.split("（")[0].strip()
+    return (
+        f"• *{cfd_name}* `{lv['spot']:.0f}`｜{short_v}\n"
+        f"  區間 `{lv['range_low']:.0f}~{lv['range_high']:.0f}`｜翻 `{lv['flip']:.0f}`｜🚀過`{lv['bull_start']:.0f}`➔`{lv['bull_tp']:.0f}`｜🩸破`{lv['bear_start']:.0f}`➔`{lv['bear_tp']:.0f}`"
     )
-    cfd_line = format_cfd_mapping_line(s, html_mode=False)
-    line4 = f"  • 💡 建議：{build_stock_action_advice(s)}"
-    if cfd_line:
-        return f"{line1}\n{cfd_line}\n{line2}\n{line3}\n{line4}"
-    return f"{line1}\n{line2}\n{line3}\n{line4}"
 
 
 def split_telegram_message_chunks(text: str, max_len: int = 3400) -> List[str]:
@@ -1982,19 +2042,22 @@ def cleanup_legacy_alert_pngs() -> int:
     return removed
 
 
-def build_tg_reply_keyboard() -> str:
+def build_tg_reply_keyboard(force_show: bool = False) -> str:
     """
-    Telegram 聊天室底部一鍵快捷按鈕列（免打字直接點擊查詢 QQQ/GLD/SMH/NVDA/TSM/LUNR 或早報）
+    Telegram 聊天室底部一鍵快捷按鈕列：
+    設定 is_persistent=False & one_time_keyboard=True，平常點完自動收合不佔螢幕空間，
+    隨時點輸入框旁的 [⊞] 圖示或傳送「選單 / MENU」即可再次叫出！
     """
     kb = {
         "keyboard": [
             [{"text": "QQQ"}, {"text": "GLD"}, {"text": "SMH"}, {"text": "SPY"}],
             [{"text": "NVDA"}, {"text": "TSM"}, {"text": "TSLA"}, {"text": "AAPL"}],
             [{"text": "AVGO"}, {"text": "LUNR"}, {"text": "SPCX"}, {"text": "AMZN"}],
-            [{"text": "早報"}, {"text": "狀態"}, {"text": "META"}, {"text": "GOOGL"}],
+            [{"text": "早報"}, {"text": "TV同步碼"}, {"text": "狀態"}, {"text": "GOOGL"}],
         ],
         "resize_keyboard": True,
-        "is_persistent": True,
+        "one_time_keyboard": True,
+        "is_persistent": False,
     }
     return json.dumps(kb, ensure_ascii=False)
 
@@ -2415,58 +2478,41 @@ def generate_morning_briefing_report(
 ) -> str:
     now_tw = (
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
-    ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+    ).strftime("%Y-%m-%d %H:%M (UTC+8)")
 
     full_map = scan_core_14_tickers_map(core_tickers, iv_crush_drop_threshold_pct)
     scanned_map: Dict[str, WarRoomSnapshot] = {k: v[0] for k, v in full_map.items()}
     ndx_diag = analyze_nasdaq_top10_direction(scanned_map)
 
     lines = [
-        "🌅 *【美股開盤前 GEX 籌碼戰情早報】*",
-        f"時間：`{now_tw}`（未來14天內全到期日主力籌碼聚合）",
+        f"🌅 *【美股 GEX 極簡早報】* `{now_tw}`",
+        f"• 定調：{ndx_diag['overall_badge']}",
+        f"• 結構：前十大 🟢`{ndx_diag['pos_count']}` / 🔴`{ndx_diag['neg_count']}` (`{ndx_diag['total_ndx_gex']:+.0f}M`)｜QQQ `{ndx_diag['qqq_gex']:+.0f}M`｜SMH `{ndx_diag['smh_gex']:+.0f}M`",
+        ndx_diag["conclusion_plan"],
         "",
-        "🧭 *【一、 總體 Gamma 結構：法人佈局、造市商對沖與結論】*",
-        f"• *總體定調*：{ndx_diag['overall_badge']}",
-        f"• *權重與指數數據*：前十大正 Gamma `{ndx_diag['pos_count']} 檔` vs 負 Gamma `{ndx_diag['neg_count']} 檔`（合計 `{ndx_diag['total_ndx_gex']:+.1f}M`）｜QQQ `{ndx_diag['qqq_gex']:+.1f}M`｜SPY `{ndx_diag['spy_gex']:+.1f}M`｜SMH `{ndx_diag['smh_gex']:+.1f}M`",
-        f"• *① 法人籌碼操作*：{ndx_diag['inst_behavior']}",
-        f"• *② 造市商對沖機制*：{ndx_diag['mm_mechanism']}",
-        f"• *③ 實戰分析結論*：\n{ndx_diag['conclusion_plan']}",
-        "",
-        "📊 *【二、 大盤、費半與黃金五指標 (SPY / QQQ / SMH / SOXX / GLD)】*",
+        "🎯 *【US100 / 黃金 CFD 作戰點位】*",
     ]
 
+    for cfd_tk in ["QQQ", "GLD"]:
+        if cfd_tk in scanned_map:
+            lines.append(format_cfd_compact_morning_line(scanned_map[cfd_tk]))
+
+    lines.extend(["", "📊 *【大盤與費半指數 (SPY/QQQ/SMH/SOXX/GLD)】*"])
     for idx_tk in MARKET_INDEX_TICKERS:
         if idx_tk in scanned_map:
             lines.append(format_clean_3line_stock_brief(scanned_map[idx_tk]))
-            lines.append("")
 
-    lines.append("🎯 *【三、 核心自選股 13 檔開盤作戰地圖 (含 TSM)】*")
+    lines.extend(["", "📈 *【核心自選 13 檔 (點底部按鈕可單獨看圖)】*"])
     for c_tk in core_tickers:
         if c_tk in scanned_map:
             lines.append(format_clean_3line_stock_brief(scanned_map[c_tk]))
-            lines.append("")
 
-    near_breakout_lines = []
-    for tk_k, sn in scanned_map.items():
-        if tk_k in MARKET_INDEX_TICKERS:
-            continue
-        dist_bull_pct = abs(sn.bull_squeeze_trigger - sn.spot_price) / max(sn.spot_price, 0.01) * 100.0
-        dist_put_pct = abs(sn.spot_price - sn.put_wall) / max(sn.spot_price, 0.01) * 100.0
-        if dist_bull_pct <= 1.8:
-            near_breakout_lines.append(
-                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 距上方軋空啟動 `${sn.bull_squeeze_trigger:.1f}` 僅 `{dist_bull_pct:.2f}%`"
-            )
-        elif dist_put_pct <= 1.8:
-            near_breakout_lines.append(
-                f"• *{sn.ticker}* (`${sn.spot_price:.2f}`) — 緊貼下方 Put 牆 `${sn.put_wall:.1f}` 僅 `{dist_put_pct:.2f}%`"
-            )
-
-    lines.append("🔥 *【四、 臨門一腳重點關注】*")
-    if near_breakout_lines:
-        lines.extend(near_breakout_lines[:5])
-    else:
-        lines.append("• 目前核心自選股均位於支撐與壓力牆中間區間，等待開盤表態。")
-
+    tv_code_str = generate_tv_sync_code_string(scanned_map)
+    lines.extend([
+        "",
+        "📋 *【TradingView 一鍵自動畫線同步碼 (點擊下方灰框即可複製)】*",
+        f"`{tv_code_str}`",
+    ])
     return "\n".join(lines)
 
 
@@ -2487,22 +2533,52 @@ def should_send_alert_with_cooldown(ticker: str, alert_code: str) -> bool:
     return True
 
 
+def is_external_daemon_running() -> bool:
+    if not IS_WINDOWS_VPS:
+        return False
+    try:
+        ps_chk = (
+            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*gex_auto_warroom.py*--daemon-loop*' } "
+            "| Select-Object -ExpandProperty ProcessId"
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_chk],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode("utf-8", errors="ignore").strip()
+        return len(out) > 0
+    except Exception:
+        return False
+
+
 class BackgroundPatrolDaemon:
-    def __init__(self) -> None:
-        self.last_run_tw: str = "等待首輪巡邏" if IS_WINDOWS_VPS else "雲端看盤模式 (由 VPS 專責巡邏)"
+    def __init__(self, external_mode: bool = False) -> None:
+        self.external_mode = external_mode
+        self.stop_event = threading.Event()
+        self.last_run_tw: str = (
+            "由無黑窗背景常駐接手執行中"
+            if external_mode
+            else ("等待首輪巡邏" if IS_WINDOWS_VPS else "雲端看盤模式 (由 VPS 專責巡邏)")
+        )
         self.total_scans: int = 0
         self.total_pushed: int = 0
         self._last_update_id: int = 0
-        self._thread_patrol = threading.Thread(target=self._patrol_loop, daemon=True)
-        self._thread_tg_cmd = threading.Thread(target=self._tg_command_loop, daemon=True)
-        self._thread_mt5_req = threading.Thread(target=self._mt5_request_loop, daemon=True)
         cleanup_legacy_alert_pngs()
-        self._thread_patrol.start()
-        self._thread_tg_cmd.start()
-        self._thread_mt5_req.start()
+        if not external_mode:
+            self._thread_patrol = threading.Thread(target=self._patrol_loop, daemon=True)
+            self._thread_tg_cmd = threading.Thread(target=self._tg_command_loop, daemon=True)
+            self._thread_mt5_req = threading.Thread(target=self._mt5_request_loop, daemon=True)
+            self._thread_patrol.start()
+            self._thread_tg_cmd.start()
+            self._thread_mt5_req.start()
+
+    def stop_internal_threads(self) -> None:
+        self.stop_event.set()
+        self.external_mode = True
+        self.last_run_tw = "已交棒給無黑窗背景常駐執行"
 
     def _mt5_request_loop(self) -> None:
-        while True:
+        while not self.stop_event.is_set():
             try:
                 req_path = os.path.join(get_mt5_common_files_dir(), "gex_mt5_request.txt")
                 if os.path.exists(req_path):
@@ -2522,7 +2598,7 @@ class BackgroundPatrolDaemon:
             time.sleep(3)
 
     def _patrol_loop(self) -> None:
-        while True:
+        while not self.stop_event.is_set():
             try:
                 cfg = load_user_config()
                 tg_token, tg_chat_id = sanitize_tg_credentials(
@@ -2629,7 +2705,7 @@ class BackgroundPatrolDaemon:
     def _tg_command_loop(self) -> None:
         import requests
 
-        while True:
+        while not self.stop_event.is_set():
             try:
                 cfg = load_user_config()
                 tg_token, tg_chat_id = sanitize_tg_credentials(
@@ -2661,7 +2737,13 @@ class BackgroundPatrolDaemon:
                         continue
 
                     cmd_clean = text.lstrip("/").replace("gex", "").strip().upper()
-                    if cmd_clean in {"STATUS", "狀態"}:
+                    if cmd_clean in {"MENU", "選單"}:
+                        send_telegram_alert(
+                            tg_token,
+                            tg_chat_id,
+                            "🎛️ 已為你叫出底部快捷查詢選單，點擊任一代號即可看圖（點完自動收合，或點輸入框旁 ⊞ 圖示隨時開關）。",
+                        )
+                    elif cmd_clean in {"STATUS", "狀態"}:
                         now_tw = (
                             datetime.datetime.now(datetime.timezone.utc)
                             + datetime.timedelta(hours=8)
@@ -2670,6 +2752,18 @@ class BackgroundPatrolDaemon:
                             tg_token,
                             tg_chat_id,
                             f"✅ *[VPS 後台守護執行中]*\n• 目前時間：`{now_tw}`\n• 累計掃描：`{self.total_scans}` 次\n• 累計推播：`{self.total_pushed}` 則\n• 狀態：`{self.last_run_tw}`",
+                        )
+                    elif cmd_clean in {"TV", "TV同步碼", "同步碼"}:
+                        core_list = parse_watchlist_string(
+                            cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
+                        )
+                        full_map = scan_core_14_tickers_map(core_list, float(cfg.get("iv_drop_thresh", 6.0)))
+                        s_map = {k: v[0] for k, v in full_map.items()}
+                        tv_str = generate_tv_sync_code_string(s_map)
+                        send_telegram_alert(
+                            tg_token,
+                            tg_chat_id,
+                            f"📋 *【TradingView 一鍵畫線同步碼】*（點擊下方單行代碼即可複製，貼入 TV 指標設定即可自動畫出 US100、XAUUSD 與 18 檔關鍵線）：\n\n`{tv_str}`",
                         )
                     elif cmd_clean in {"MORNING", "BRIEF", "早報"}:
                         core_list = parse_watchlist_string(
@@ -2783,7 +2877,7 @@ def run_streamlit_warroom() -> None:
 
     @st.cache_resource
     def get_bg_daemon() -> BackgroundPatrolDaemon:
-        return BackgroundPatrolDaemon()
+        return BackgroundPatrolDaemon(external_mode=is_external_daemon_running())
 
     @st.cache_data(ttl=300, show_spinner=False)
     def cached_core_14_scan(wl_tuple: Tuple[str, ...], iv_thresh: float) -> Dict[str, WarRoomSnapshot]:
@@ -2908,6 +3002,7 @@ def run_streamlit_warroom() -> None:
 
         if IS_WINDOWS_VPS:
             if st.button("👻 一鍵啟動『無黑窗隱形背景常駐』並加入開機自啟 (按完即可關掉 CMD)"):
+                daemon.stop_internal_threads()
                 ok_st, msg_st = enable_invisible_windows_background_service()
                 if ok_st:
                     st.success(msg_st)
@@ -2951,6 +3046,10 @@ def run_streamlit_warroom() -> None:
                 st.error(summary_md)
             else:
                 st.warning(summary_md)
+
+            with st.expander("📋 點此複製【TradingView 一鍵自動畫線同步碼】（含 US100、黃金 XAUUSD 與 18 檔核心股）", expanded=False):
+                st.caption("點擊下方程式碼方塊右上角的「複製」圖示，貼進 TradingView 指標設定的『貼上 TV 同步碼』欄位，即可自動畫出所有支撐壓力與起漲/加空/平倉線：")
+                st.code(generate_tv_sync_code_string(snap_map), language="text")
 
             st.markdown("#### 🚦 二、 核心 18 檔（SPY/QQQ/SMH/SOXX/GLD + 13 檔核心自選股含 TSM）正負 Gamma 即時燈號牆（點擊任一檔直接看下方日K圖）")
             if "selected_ticker" not in st.session_state:
