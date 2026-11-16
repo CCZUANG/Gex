@@ -766,8 +766,21 @@ def evaluate_snapshot_and_alerts(
     high_curr = float(df_ohlcv["High"].iloc[-1])
     low_curr = float(df_ohlcv["Low"].iloc[-1])
     open_curr = float(df_ohlcv["Open"].iloc[-1])
-    vol_curr = float(df_ohlcv["Volume"].iloc[-1])
+    raw_vol_curr = float(df_ohlcv["Volume"].iloc[-1])
     vol_ma20 = float(df_ohlcv["Volume"].tail(20).mean())
+
+    # 盤中量能時間進度校正：美股開盤前幾小時，當日累計量尚未走完 6.5 小時，若直接跟 20 日「全日均量」比會永遠偏低；
+    # 依美東 09:30 (14:30 UTC) 起算已開盤時間比例推算預估全日量 (最低分母鎖定 0.15 防開盤前 5 分鐘雜訊)
+    now_utc_v = datetime.datetime.now(datetime.timezone.utc)
+    if now_utc_v.weekday() < 5:
+        mins_since_open = (now_utc_v.hour * 60 + now_utc_v.minute) - (14 * 60 + 30)
+        if 5 <= mins_since_open < 390:
+            pace_frac = max(mins_since_open / 390.0, 0.15)
+            vol_curr = raw_vol_curr / pace_frac
+        else:
+            vol_curr = raw_vol_curr
+    else:
+        vol_curr = raw_vol_curr
 
     bar_range = max(high_curr - low_curr, 0.01)
     upper_wick_ratio = (high_curr - max(open_curr, spot)) / bar_range
@@ -866,11 +879,11 @@ def evaluate_snapshot_and_alerts(
 
     max_pain = compute_max_pain(df)
 
-    # 多頭起漲點 (bull_trigger)：
-    # 若目前在負 Gamma (spot < zero_gamma)，必須先站上翻轉點 zero_gamma 才會結束負 Gamma 助跌，
-    # 因此多頭起漲點必須 >= max(spot * 1.006, zero_gamma)，絕不會挑到僅差 $0.11 且還在翻轉點下方的價平履約價！
-    min_bull_strike = max(spot * 1.006, zero_gamma if not is_pos_gamma else spot * 1.005)
-    bull_cands = df[(df["strike"] >= min_bull_strike) & (df["strike"] <= spot * 1.14)].copy()
+    # 多頭起漲點 (bull_trigger) 與空頭加空點 (bear_trigger) 以「昨收 prev_close」為基準搜尋，
+    # 讓盤中現價 (spot) 帶量突破或跌破時能夠真實觸發 crossover 警報 (避免用 spot*1.006 導致永遠無法觸及)！
+    anchor_px = prev_close if prev_close > 0 else spot
+    min_bull_strike = max(anchor_px * 1.005, zero_gamma if not is_pos_gamma else anchor_px * 1.005)
+    bull_cands = df[(df["strike"] >= min_bull_strike) & (df["strike"] <= max(spot, anchor_px) * 1.14)].copy()
     if not bull_cands.empty:
         bull_cands["sq_score"] = bull_cands["call_gex_raw_m"] * (
             1.0 + bull_cands["call_vol_oi"]
@@ -879,9 +892,8 @@ def evaluate_snapshot_and_alerts(
     else:
         bull_trigger = max(next_upper_call_wall, round(min_bull_strike, 2))
 
-    # 空頭破牆加空點 (bear_trigger)：至少低於現價 0.5%，若主力 Put 牆已跌破則對齊下方次級支撐牆
-    max_bear_strike = min(spot * 0.995, zero_gamma if is_pos_gamma else spot * 0.995)
-    bear_cands = df[(df["strike"] <= max_bear_strike) & (df["strike"] >= spot * 0.86)].copy()
+    max_bear_strike = min(anchor_px * 0.995, zero_gamma if is_pos_gamma else anchor_px * 0.995)
+    bear_cands = df[(df["strike"] <= max_bear_strike) & (df["strike"] >= min(spot, anchor_px) * 0.86)].copy()
     if not bear_cands.empty:
         bear_cands["cr_score"] = np.abs(bear_cands["put_gex_m"]) * (
             1.0 + bear_cands["put_vol_oi"]
@@ -971,6 +983,80 @@ def evaluate_snapshot_and_alerts(
             )
         )
 
+    if (
+        (prev_close > bear_trigger >= spot)
+        or (prev_close > next_lower_put_wall >= spot)
+    ) and vol_curr > vol_ma20 * 0.95:
+        trig_px = bear_trigger if prev_close > bear_trigger >= spot else next_lower_put_wall
+        entry = round(spot, 2)
+        tp = round(min(bear_exhaust, spot * 0.95), 2)
+        reward = max(entry - tp, spot * 0.03)
+        sl = round(entry + reward / 2.3, 2)
+        alerts.append(
+            AlertSignal(
+                code="BEAR_BREAKDOWN_SHORT",
+                title=f"🩸 【{ticker} 跌破加空點 ${trig_px:.2f} — 順勢做空進場訊號】",
+                chart_badge=f"[跌破加空] 跌破 ${trig_px:.2f} 順勢做空",
+                description=(
+                    f"現價 ${spot:.2f} 跌破下方關鍵防線 ${trig_px:.2f} (量比 {vol_curr/max(vol_ma20,1):.2f}x)，"
+                    f"造市商負 Gamma 順勢拋售助跌！"
+                ),
+                action_plan="順勢做空或買進 Put 價差，嚴禁逆勢接刀。",
+                entry_price=entry,
+                sl_price=sl,
+                tp_price=tp,
+                rrr=2.3,
+            )
+        )
+
+    if is_pos_gamma and (put_wall * 0.996 <= spot <= put_wall * 1.008) and (low_curr <= put_wall * 1.005):
+        entry = round(spot, 2)
+        tp = round(max(max_pain, call_wall), 2)
+        if tp <= entry:
+            tp = round(entry * 1.03, 2)
+        reward = max(tp - entry, spot * 0.02)
+        sl = round(entry - reward / 2.2, 2)
+        alerts.append(
+            AlertSignal(
+                code="POS_GAMMA_PUT_BOUNCE",
+                title=f"🟢 【{ticker} 正 Gamma 回測 Put 支撐牆 ${put_wall:.2f} — 逢低做多進場訊號】",
+                chart_badge=f"[Put牆低接做多] 回測 ${put_wall:.2f} 護盤買盤",
+                description=(
+                    f"正 Gamma 體制下回測下方主力 Put 支撐牆 ${put_wall:.2f} 止穩，"
+                    f"造市商逢低買進護盤支撐力道強。"
+                ),
+                action_plan="於 Put 牆上方逢低做多，目標上看 Max Pain / Call 牆。",
+                entry_price=entry,
+                sl_price=sl,
+                tp_price=tp,
+                rrr=2.2,
+            )
+        )
+
+    if is_pos_gamma and (call_wall * 0.992 <= spot < call_wall) and (vol_curr < vol_ma20 * 1.35):
+        entry = round(spot, 2)
+        tp = round(min(max_pain, put_wall), 2)
+        if tp >= entry:
+            tp = round(entry * 0.97, 2)
+        reward = max(entry - tp, spot * 0.02)
+        sl = round(entry + reward / 2.2, 2)
+        alerts.append(
+            AlertSignal(
+                code="POS_GAMMA_CALL_REJECT",
+                title=f"🔻 【{ticker} 正 Gamma 觸及 Call 壓力牆 ${call_wall:.2f} — 逢高減碼/短空訊號】",
+                chart_badge=f"[Call牆遇壓] 觸及 ${call_wall:.2f} 高拋賣壓",
+                description=(
+                    f"正 Gamma 體制下反彈接近上方主力 Call 壓力牆 ${call_wall:.2f} 且未爆量衝破，"
+                    f"造市商逢高賣壓將壓制漲勢。"
+                ),
+                action_plan="多單逢高獲利減碼，激進者可輕倉短空回歸 Max Pain。",
+                entry_price=entry,
+                sl_price=sl,
+                tp_price=tp,
+                rrr=2.2,
+            )
+        )
+
     if prev_close > put_wall >= spot and vol_curr > vol_ma20 * 1.1:
         entry = round(spot, 2)
         tp = round(min(bear_exhaust, spot * 0.94), 2)
@@ -993,36 +1079,67 @@ def evaluate_snapshot_and_alerts(
             )
         )
 
-    is_iv_crushing = iv_drop_rel_pct >= iv_crush_drop_threshold_pct
+    # 僅在負 Gamma 或當日漲跌幅 >= 1.5% 時，IV 回落 >= 6% 才視為 Squeeze 動能衰竭（過濾正 Gamma 正常開盤降 IV 雜訊）
+    day_chg_abs_pct = abs((spot - prev_close) / max(prev_close, 0.01)) * 100.0
+    is_iv_crushing = (iv_drop_rel_pct >= iv_crush_drop_threshold_pct) and (
+        (not is_pos_gamma) or day_chg_abs_pct >= 1.5
+    )
     is_price_exhausted = (high_curr >= bull_exhaust * 0.995) and (upper_wick_ratio > 0.45) and (spot > bull_trigger)
-    if is_iv_crushing or is_price_exhausted:
-        entry = round(spot, 2)
-        tp = round(max(zero_gamma, max_pain), 2)
-        if tp >= entry:
-            tp = round(entry * 0.94, 2)
-        reward = max(entry - tp, spot * 0.03)
-        sl = round(entry + reward / 2.2, 2)
-        reason_str = (
-            f"ATM IV 從盤中高點 {iv_peak_pct:.1f}% 回落至 {atm_iv_pct:.1f}% (相對跌幅 {iv_drop_rel_pct:.1f}%)"
-            if is_iv_crushing
-            else f"最高價 ${high_curr:.2f} 觸及衰竭天花板 ${bull_exhaust:.2f} 且留長上影線 ({upper_wick_ratio*100:.0f}%)"
-        )
-        alerts.append(
-            AlertSignal(
-                code="SQUEEZE_EXHAUSTION_IV_CRUSH",
-                title=f"⚠️ 【{ticker} Gamma Squeeze 衰竭 & IV 回落反轉警報】",
-                chart_badge=f"[Squeeze 衰竭 / IV 回落] IV 跌 {iv_drop_rel_pct:.1f}% 造市商倒貨警戒",
-                description=(
-                    f"{reason_str}！Vanna 與 Charm 效應啟動，買方權利金縮水引發多殺多，"
-                    f"造市商正大量拋售避險現貨股票平倉。"
-                ),
-                action_plan="多頭與 Long Call 部位務必立即獲利了結離場；激進者可逢高布局回歸 Max Pain 之空單。",
-                entry_price=entry,
-                sl_price=sl,
-                tp_price=tp,
-                rrr=2.2,
+    is_bear_exhausted = (not is_pos_gamma) and (low_curr <= bear_exhaust * 1.005) and (spot < prev_close)
+
+    if is_iv_crushing or is_price_exhausted or is_bear_exhausted:
+        is_bear_cover_case = is_bear_exhausted or (is_iv_crushing and spot < prev_close)
+        if is_bear_cover_case:
+            entry = round(spot, 2)
+            tp = round(min(zero_gamma, max_pain), 2)
+            if tp <= entry:
+                tp = round(entry * 1.05, 2)
+            reward = max(tp - entry, spot * 0.03)
+            sl = round(entry - reward / 2.2, 2)
+            alerts.append(
+                AlertSignal(
+                    code="BEAR_EXHAUSTION_COVER",
+                    title=f"✅ 【{ticker} 空單獲利回補平倉警報（空頭動能衰竭 / IV 降溫）】",
+                    chart_badge=f"[空單平倉/止跌警戒] IV 跌 {iv_drop_rel_pct:.1f}% 造市商買回平倉",
+                    description=(
+                        f"下檔觸及空頭衰竭區或恐慌 IV 從 {iv_peak_pct:.1f}% 降溫至 {atm_iv_pct:.1f}%！"
+                        f"Put 權利金縮水迫使造市商買回先前放空之避險現貨，嚴防急彈。"
+                    ),
+                    action_plan="既有空單與 Long Put 務必分批獲利回補平倉，嚴禁再追空。",
+                    entry_price=entry,
+                    sl_price=sl,
+                    tp_price=tp,
+                    rrr=2.2,
+                )
             )
-        )
+        else:
+            entry = round(spot, 2)
+            tp = round(max(zero_gamma, max_pain), 2)
+            if tp >= entry:
+                tp = round(entry * 0.94, 2)
+            reward = max(entry - tp, spot * 0.03)
+            sl = round(entry + reward / 2.2, 2)
+            reason_str = (
+                f"ATM IV 從盤中高點 {iv_peak_pct:.1f}% 回落至 {atm_iv_pct:.1f}% (相對跌幅 {iv_drop_rel_pct:.1f}%)"
+                if is_iv_crushing
+                else f"最高價 ${high_curr:.2f} 觸及衰竭天花板 ${bull_exhaust:.2f} 且留長上影線 ({upper_wick_ratio*100:.0f}%)"
+            )
+            alerts.append(
+                AlertSignal(
+                    code="SQUEEZE_EXHAUSTION_IV_CRUSH",
+                    title=f"⚠️ 【{ticker} 多單獲利平倉警報（軋空衰竭 / IV 回落）】",
+                    chart_badge=f"[多單平倉/IV回落] IV 跌 {iv_drop_rel_pct:.1f}% 造市商倒貨警戒",
+                    description=(
+                        f"{reason_str}！Vanna 與 Charm 效應啟動，買方權利金縮水引發多殺多，"
+                        f"造市商正大量拋售避險現貨股票平倉。"
+                    ),
+                    action_plan="既有多單與 Long Call 務必立即獲利平倉離場，嚴禁追多。",
+                    entry_price=entry,
+                    sl_price=sl,
+                    tp_price=tp,
+                    rrr=2.2,
+                )
+            )
 
     tk_state["iv_peak_pct"] = round(iv_peak_pct, 2)
     tk_state["last_spot"] = round(spot, 2)
@@ -1552,7 +1669,8 @@ def classify_tactical_verdict(
     bear_start = min(s.bear_squeeze_trigger, s.put_wall) * mult
     bear_tp_exhaust = min(s.bear_exhaustion_price * mult, range_low * 0.985, bear_start * 0.98)
 
-    iv_crushing = s.iv_drop_from_peak_pct >= 6.0
+    day_chg_abs_pct = abs((s.spot_price - s.prev_close) / max(s.prev_close, 0.01)) * 100.0
+    iv_crushing = (s.iv_drop_from_peak_pct >= 6.0) and ((not s.is_positive_gamma) or day_chg_abs_pct >= 1.5)
     near_bull_exhaust = spot >= bull_tp_exhaust * 0.995
     near_bear_exhaust = spot <= bear_tp_exhaust * 1.005
 
@@ -1570,21 +1688,35 @@ def classify_tactical_verdict(
         "bear_tp": bear_tp_exhaust,
     }
 
-    if iv_crushing or near_bull_exhaust or near_bear_exhaust:
-        verdict = "⚪ 【空手觀察 / 獲利了結】（已進入動能衰竭或 IV 回落反轉區）"
+    if near_bull_exhaust or (iv_crushing and s.spot_price >= s.prev_close):
+        verdict = "⚠️ 【多單平倉 / 禁追多】（抵達上檔衰竭區或追價 IV 回落）"
         reason = (
-            f"現價 (${spot:.1f}) 已逼近衰竭目標或觸發 IV 回落 ({s.iv_drop_from_peak_pct:.1f}%)，"
-            f"追價肉少風險大，原順勢部位建議立即平倉落袋，空手等待下一波回測支撐或重新突破。"
+            f"現價 (${spot:.1f}) 已觸及上檔多頭衰竭區 (${bull_tp_exhaust:.1f}) 或 IV 回落 {s.iv_drop_from_peak_pct:.1f}%；"
+            f"既有【多單建議獲利平倉】，嚴禁高檔追多（激進者可短空看痛點 ${mp:.1f}），空手等回測支撐。"
+        )
+        return verdict, reason, levels
+
+    if near_bear_exhaust or (iv_crushing and s.spot_price < s.prev_close):
+        verdict = "✅ 【空單平倉 / 禁追空】（抵達下檔衰竭區或恐慌 IV 降溫）"
+        reason = (
+            f"現價 (${spot:.1f}) 已觸及下檔空頭衰竭區 (${bear_tp_exhaust:.1f}) 或恐慌 IV 回落 {s.iv_drop_from_peak_pct:.1f}%；"
+            f"既有【空單建議獲利回補平倉】，嚴禁殺低追空，造市商將買回避險現貨、嚴防急彈。"
         )
         return verdict, reason, levels
 
     if not s.is_positive_gamma:
         is_inverted_call_squeeze = s.zero_gamma_flip < s.spot_price * 0.995
-        if spot <= bear_start or s.put_wall > s.spot_price:
+        if spot <= bear_start:
             verdict = "🔴 【順勢做空】（跌破支撐牆觸發負 Gamma 助跌）"
             reason = (
-                f"現價 (${spot:.1f}) 已跌破關鍵防線 (${bear_start:.1f}) 處於負 Gamma 助跌區，"
+                f"現價 (${spot:.1f}) 已跌破關鍵加空防線 (${bear_start:.1f}) 處於負 Gamma 助跌區，"
                 f"造市商被迫順勢拋售避險；反彈不破 ${bear_start:.1f} 偏空操作，空單跌至 ${bear_tp_exhaust:.1f} 建議分批平倉回補。"
+            )
+        elif s.put_wall > s.spot_price:
+            verdict = "🔴 【反彈偏空 / 觀察次撐】（已跌破主力 Put 牆轉反壓）"
+            reason = (
+                f"現價 (${spot:.1f}) 已跌破主力 Put 牆 (${pw:.1f})，原支撐轉為上方反壓；"
+                f"反彈不過 ${pw:.1f} 偏空看待，下檔先看次級支撐/加空點 ${bear_start:.1f}（若再跌破 ${bear_start:.1f} 才加空看 ${bear_tp_exhaust:.1f}）。"
             )
         elif spot >= bull_start:
             verdict = "🟢 【順勢做多】（突破負 Gamma 軋空起漲點）"
@@ -1850,11 +1982,48 @@ def cleanup_legacy_alert_pngs() -> int:
     return removed
 
 
+def build_tg_reply_keyboard() -> str:
+    """
+    Telegram 聊天室底部一鍵快捷按鈕列（免打字直接點擊查詢 QQQ/GLD/SMH/NVDA/TSM/LUNR 或早報）
+    """
+    kb = {
+        "keyboard": [
+            [{"text": "QQQ"}, {"text": "GLD"}, {"text": "SMH"}, {"text": "SPY"}],
+            [{"text": "NVDA"}, {"text": "TSM"}, {"text": "TSLA"}, {"text": "AAPL"}],
+            [{"text": "AVGO"}, {"text": "LUNR"}, {"text": "SPCX"}, {"text": "AMZN"}],
+            [{"text": "早報"}, {"text": "狀態"}, {"text": "META"}, {"text": "GOOGL"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+    return json.dumps(kb, ensure_ascii=False)
+
+
+def compact_caption_for_photo(message_md: str, max_chars: int = 980) -> str:
+    """
+    將單股戰情卡精準控制在 Telegram sendPhoto caption 上限 (1,024 字元) 內，
+    確保「K線圖片 + 完整多空建議與點位」永遠合併在同一則訊息送達，手機不會連響兩聲！
+    """
+    clean_md = message_md.replace("*", "").replace("`", "")
+    if len(clean_md) <= max_chars:
+        return clean_md
+    lines = clean_md.split("\n")
+    out = []
+    curr_len = 0
+    for ln in lines:
+        if curr_len + len(ln) + 1 > max_chars - 25:
+            break
+        out.append(ln)
+        curr_len += len(ln) + 1
+    return "\n".join(out)
+
+
 def send_telegram_alert_with_detail(
     bot_token: str,
     chat_id: str,
     message_md: str,
     image_path: Optional[str] = None,
+    silent: bool = False,
 ) -> Tuple[bool, str]:
     clean_tok, clean_cid = sanitize_tg_credentials(bot_token, chat_id)
     if not clean_tok or not clean_cid:
@@ -1868,24 +2037,26 @@ def send_telegram_alert_with_detail(
         except requests.exceptions.SSLError:
             return requests.post(url, data=data_dict, files=files_dict, timeout=20, verify=False)
 
+    kb_json = build_tg_reply_keyboard()
     try:
+        # 單股附圖推播：直接將重點戰情卡合併進圖片 caption (<=980字)，實現「1張圖+完整點位單則送達、手機只響一聲」！
         if image_path and os.path.exists(image_path):
             url_photo = f"https://api.telegram.org/bot{clean_tok}/sendPhoto"
-            short_cap = (
-                f"📊 {os.path.basename(image_path)} — 完整期權 GEX 日K點位請見下方戰情卡"
-                if len(message_md) > 850
-                else message_md
-            )
+            merged_cap = compact_caption_for_photo(message_md, max_chars=980)
             with open(image_path, "rb") as img_f:
                 r_img = _post_tg(
                     url_photo,
-                    {"chat_id": clean_cid, "caption": short_cap},
+                    {
+                        "chat_id": clean_cid,
+                        "caption": merged_cap,
+                        "disable_notification": "true" if silent else "false",
+                        "reply_markup": kb_json,
+                    },
                     {"photo": img_f},
                 )
-            if r_img.status_code != 200:
-                return False, f"sendPhoto HTTP {r_img.status_code}: {r_img.text[:160]}"
-            if len(message_md) <= 850:
-                return True, "圖文單則推播成功"
+            if r_img.status_code == 200:
+                return True, "圖文合一單則推播成功"
+            return False, f"sendPhoto HTTP {r_img.status_code}: {r_img.text[:160]}"
 
         url_msg = f"https://api.telegram.org/bot{clean_tok}/sendMessage"
         chunks = split_telegram_message_chunks(message_md, max_len=3400)
@@ -1897,6 +2068,8 @@ def send_telegram_alert_with_detail(
                     "text": chunk_txt,
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": "true",
+                    "disable_notification": "true" if silent else "false",
+                    "reply_markup": kb_json,
                 },
             )
             if r_txt.status_code != 200:
@@ -1907,6 +2080,8 @@ def send_telegram_alert_with_detail(
                         "chat_id": clean_cid,
                         "text": plain_text,
                         "disable_web_page_preview": "true",
+                        "disable_notification": "true" if silent else "false",
+                        "reply_markup": kb_json,
                     },
                 )
                 if r_plain.status_code != 200:
@@ -1926,8 +2101,9 @@ def send_telegram_alert(
     chat_id: str,
     message_md: str,
     image_path: Optional[str] = None,
+    silent: bool = False,
 ) -> bool:
-    ok, _ = send_telegram_alert_with_detail(bot_token, chat_id, message_md, image_path)
+    ok, _ = send_telegram_alert_with_detail(bot_token, chat_id, message_md, image_path, silent=silent)
     return ok
 
 
@@ -2442,7 +2618,7 @@ class BackgroundPatrolDaemon:
                                     f"  • 建議：進場 `${a0.entry_price:.2f}`｜停損 `${a0.sl_price:.2f}`｜目標 `${a0.tp_price:.2f}` (`RRR 1:{a0.rrr:.1f}`)",
                                     "",
                                 ])
-                            if send_telegram_alert(tg_token, tg_chat_id, "\n".join(digest_lines)):
+                            if send_telegram_alert(tg_token, tg_chat_id, "\n".join(digest_lines), silent=False):
                                 self.total_pushed += 1
                     else:
                         self.last_run_tw = "非美股開盤時段自動待機中"
