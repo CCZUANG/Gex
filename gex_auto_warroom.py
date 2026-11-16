@@ -391,11 +391,15 @@ def save_tracker_state(state: Dict) -> None:
 
 
 def is_us_market_active_window() -> bool:
+    """
+    美股期權市場正規交易時段為美東 09:30 ~ 16:00（夏令 13:30~20:00 UTC / 冬令 14:30~21:00 UTC，即冬令台灣時間 22:30~05:00）。
+    避開 21:00~22:25 盤前期權未開盤時段 Yahoo Finance 重置 IV 為 0 的問題。
+    """
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     if now_utc.weekday() >= 5:
         return False
     utc_hour_float = now_utc.hour + now_utc.minute / 60.0
-    return 13.0 <= utc_hour_float <= 21.5
+    return 14.45 <= utc_hour_float <= 21.2
 
 
 def is_premarket_briefing_window() -> bool:
@@ -1971,8 +1975,25 @@ def fetch_live_market_data(
             if df_e.empty:
                 continue
             exp_d_obj = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
-            dte_e = max(float((exp_d_obj - today_dt).days), 0.5)
-            tte_e = max(dte_e / 365.0, 1.0 / (365.0 * 24.0))
+            raw_days = (exp_d_obj - today_dt).days
+            # 若為當日到期 (0 DTE) 且處於美股開盤前無有效報價時段，跳過該期避免 0.5 DTE 搭配歸零 IV 造成價平 Gamma 虛爆
+            if raw_days <= 0 and len(selected_exps) > 1:
+                continue
+            dte_e = max(float(raw_days), 1.0)
+            tte_e = max(dte_e / 365.0, 1.0 / 365.0)
+
+            # 盤前/休市 Yahoo Finance 常將部分履約價之 impliedVolatility 重置為 0.00001；
+            # 自動以 20 日歷史波動率 (HV) 或有效中位數 IV 修復低於 8% 之異常歸零 IV！
+            log_r = np.log(df_ohlcv["Close"] / df_ohlcv["Close"].shift(1)).dropna()
+            hv_fallback = float(np.clip(log_r.std() * np.sqrt(252), 0.15, 1.20)) if len(log_r) >= 5 else 0.30
+            valid_c_iv = df_e.loc[df_e["call_iv"] > 0.08, "call_iv"]
+            c_iv_med = float(valid_c_iv.median()) if not valid_c_iv.empty else hv_fallback
+            valid_p_iv = df_e.loc[df_e["put_iv"] > 0.08, "put_iv"]
+            p_iv_med = float(valid_p_iv.median()) if not valid_p_iv.empty else hv_fallback
+
+            df_e["call_iv"] = np.where(df_e["call_iv"] > 0.08, df_e["call_iv"], c_iv_med)
+            df_e["put_iv"] = np.where(df_e["put_iv"] > 0.08, df_e["put_iv"], p_iv_med)
+
             _, _, c_gam_e, _, _ = bs_greeks(
                 spot, df_e["strike"].values, tte_e, df_e["call_iv"].values
             )
