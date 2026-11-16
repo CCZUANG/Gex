@@ -268,10 +268,51 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
     return primary_csv
 
 
+DAEMON_PID_FILE = os.path.join(BASE_DIR, "gex_daemon.pid")
+VERIFIED_CACHE_FILE = os.path.join(BASE_DIR, "gex_verified_cache.pkl")
+
+
+def kill_old_background_daemons() -> None:
+    """
+    自動終止舊版殘留的無黑窗 --daemon-loop 背景程序，避免覆蓋新版程式後，舊版仍在背景狂發舊格式警報！
+    """
+    curr_pid = os.getpid()
+    if os.path.exists(DAEMON_PID_FILE):
+        try:
+            with open(DAEMON_PID_FILE, "r", encoding="utf-8") as pf:
+                old_pid = int(pf.read().strip())
+            if old_pid != curr_pid:
+                if IS_WINDOWS_VPS:
+                    subprocess.call(
+                        ["taskkill", "/F", "/PID", str(old_pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    os.kill(old_pid, 9)
+        except Exception:
+            pass
+    # Windows WMIC/PowerShell 雙保險：清除任何帶有 gex_auto_warroom.py --daemon-loop 的舊背景 python
+    if IS_WINDOWS_VPS:
+        try:
+            ps_cmd = (
+                f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*gex_auto_warroom.py*--daemon-loop*' -and $_.ProcessId -ne {curr_pid} }} "
+                "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+            subprocess.call(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
 def enable_invisible_windows_background_service() -> Tuple[bool, str]:
     if not IS_WINDOWS_VPS:
         return False, "目前非 Windows 系統，無需設定 Windows 隱形背景常駐。"
     try:
+        kill_old_background_daemons()
         appdata = os.environ.get("APPDATA", "")
         startup_dir = os.path.join(
             appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
@@ -2066,6 +2107,44 @@ def fetch_live_market_data(
     return ticker.upper(), df_ohlcv, df_chain, exp_label, dte_days
 
 
+CACHE_LOCK = threading.Lock()
+
+
+def load_verified_cache_entry(ticker: str) -> Optional[Tuple[WarRoomSnapshot, pd.DataFrame, pd.DataFrame]]:
+    import pickle
+
+    with CACHE_LOCK:
+        if os.path.exists(VERIFIED_CACHE_FILE):
+            try:
+                with open(VERIFIED_CACHE_FILE, "rb") as f:
+                    db = pickle.load(f)
+                return db.get(ticker.upper())
+            except Exception:
+                return None
+    return None
+
+
+def save_verified_cache_entry(
+    ticker: str, snap: WarRoomSnapshot, df_ohlcv: pd.DataFrame, df_gex: pd.DataFrame
+) -> None:
+    import pickle
+
+    with CACHE_LOCK:
+        db = {}
+        if os.path.exists(VERIFIED_CACHE_FILE):
+            try:
+                with open(VERIFIED_CACHE_FILE, "rb") as f:
+                    db = pickle.load(f)
+            except Exception:
+                db = {}
+        db[ticker.upper()] = (snap, df_ohlcv, df_gex)
+        try:
+            with open(VERIFIED_CACHE_FILE, "wb") as f:
+                pickle.dump(db, f)
+        except Exception:
+            pass
+
+
 def scan_single_ticker_worker(
     ticker: str, exp_index: int = 0, iv_crush_drop_threshold_pct: float = 6.0
 ) -> Optional[Tuple[WarRoomSnapshot, pd.DataFrame, pd.DataFrame]]:
@@ -2073,9 +2152,19 @@ def scan_single_ticker_worker(
         tk, df_ohlcv, df_chain, exp_d, dte = fetch_live_market_data(
             ticker, exp_index=exp_index, interval="1d", period="3mo"
         )
+        total_opt_vol = float(df_chain["call_vol"].sum() + df_chain["put_vol"].sum())
+        # 若為盤前/開盤瞬間交易所已將 Volume 清零 (total_opt_vol <= 10)，優先直接沿用前一個交易日凍結的完整籌碼快照，
+        # 不拿「成交量歸零」的半殘資料去重算，直到開盤後真實成交量進來才重新計算並覆蓋快取！
+        if exp_index == 0 and total_opt_vol <= 10.0:
+            cached = load_verified_cache_entry(tk)
+            if cached is not None:
+                return cached
+
         snap, df_gex = evaluate_snapshot_and_alerts(
             tk, df_ohlcv, df_chain, exp_d, dte, iv_crush_drop_threshold_pct
         )
+        if exp_index == 0 and total_opt_vol > 10.0:
+            save_verified_cache_entry(tk, snap, df_ohlcv, df_gex)
         return snap, df_ohlcv, df_gex
     except Exception:
         return None
@@ -3092,6 +3181,12 @@ def main() -> None:
         return
 
     if args.daemon_loop:
+        kill_old_background_daemons()
+        try:
+            with open(DAEMON_PID_FILE, "w", encoding="utf-8") as pf:
+                pf.write(str(os.getpid()))
+        except Exception:
+            pass
         _daemon = BackgroundPatrolDaemon()
         while True:
             time.sleep(3600)
