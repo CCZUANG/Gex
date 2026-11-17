@@ -472,6 +472,17 @@ def is_premarket_briefing_window() -> bool:
     return (790 <= utc_hm <= 808) or (850 <= utc_hm <= 868)
 
 
+def is_morning_0600_rollover_window() -> bool:
+    """
+    台灣時間週二至週六早上 06:00 ~ 06:25 (對應美股週一至週五收盤結算後、OANDA 換日時段)，
+    自動同步最新收盤 GEX 點位至 MT5 Common\Files\gex_mt5_levels.csv 並發送 06:00 換日早報。
+    """
+    now_tw = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    if now_tw.weekday() not in {1, 2, 3, 4, 5}:
+        return False
+    return now_tw.hour == 6 and 0 <= now_tw.minute <= 25
+
+
 # ============================================================================
 # 1. 全美股代碼庫自動載入器 + 第一階段現貨量價快篩
 # ============================================================================
@@ -841,24 +852,32 @@ def evaluate_snapshot_and_alerts(
     atm_idx = int(np.argmin(np.abs(strikes - spot)))
     atm_iv_pct = float(((call_iv[atm_idx] + put_iv[atm_idx]) / 2.0) * 100.0)
 
-    today_tw_str = (
-        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    # 以美東交易日 (UTC-5) 作為當日 IV 峰值基準日，避免台灣時間凌晨 00:00~05:00 (前一日美股尾盤) 的高 IV 殘留到當晚！
+    # 且當美股期權未開盤 (not is_us_market_active_window()) 時，期權根本沒有成交，強制鎖定 iv_drop_rel_pct = 0.0，絕不在休市期間誤報 IV 回落！
+    us_trading_date_str = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=5)
     ).strftime("%Y-%m-%d")
     tracker = load_tracker_state()
     tk_state = tracker.get(ticker.upper(), {})
-    if tk_state.get("iv_peak_date") == today_tw_str:
-        recorded_iv_peak = float(tk_state.get("iv_peak_pct", atm_iv_pct))
-    else:
-        recorded_iv_peak = atm_iv_pct
+    mkt_open_now = is_us_market_active_window()
     if simulated_iv_peak_pct is not None:
         iv_peak_pct = max(simulated_iv_peak_pct, atm_iv_pct)
-    else:
+        iv_drop_rel_pct = (
+            ((iv_peak_pct - atm_iv_pct) / iv_peak_pct) * 100.0 if iv_peak_pct > 0 else 0.0
+        )
+    elif mkt_open_now:
+        if tk_state.get("iv_peak_date") == us_trading_date_str:
+            recorded_iv_peak = float(tk_state.get("iv_peak_pct", atm_iv_pct))
+        else:
+            recorded_iv_peak = atm_iv_pct
         iv_peak_pct = max(recorded_iv_peak, atm_iv_pct)
-    tk_state["iv_peak_date"] = today_tw_str
-
-    iv_drop_rel_pct = (
-        ((iv_peak_pct - atm_iv_pct) / iv_peak_pct) * 100.0 if iv_peak_pct > 0 else 0.0
-    )
+        tk_state["iv_peak_date"] = us_trading_date_str
+        iv_drop_rel_pct = (
+            ((iv_peak_pct - atm_iv_pct) / iv_peak_pct) * 100.0 if iv_peak_pct > 0 else 0.0
+        )
+    else:
+        iv_peak_pct = atm_iv_pct
+        iv_drop_rel_pct = 0.0
 
     expected_move_pct = (atm_iv_pct / 100.0) * math.sqrt(tte_years)
     expected_move_usd = spot * expected_move_pct
@@ -1100,16 +1119,18 @@ def evaluate_snapshot_and_alerts(
             )
         )
 
-    # 僅在負 Gamma 或當日漲跌幅 >= 1.5% 時，IV 回落 >= 6% 才視為 Squeeze 動能衰竭（過濾正 Gamma 正常開盤降 IV 雜訊）
+    # 僅在美股期權開盤時段、且處於負 Gamma (或大漲跌 >= 1.5%) 時，IV 回落 >= 6% 才視為 Squeeze 動能衰竭
     day_chg_abs_pct = abs((spot - prev_close) / max(prev_close, 0.01)) * 100.0
     is_iv_crushing = (iv_drop_rel_pct >= iv_crush_drop_threshold_pct) and (
         (not is_pos_gamma) or day_chg_abs_pct >= 1.5
     )
+    is_bull_iv_crush = is_iv_crushing and (spot >= prev_close) and (spot >= min(bull_trigger, call_wall) * 0.995)
+    is_bear_iv_crush = is_iv_crushing and (spot < prev_close) and (spot <= max(bear_trigger, put_wall) * 1.005)
     is_price_exhausted = (high_curr >= bull_exhaust * 0.995) and (upper_wick_ratio > 0.45) and (spot > bull_trigger)
     is_bear_exhausted = (not is_pos_gamma) and (low_curr <= bear_exhaust * 1.005) and (spot < prev_close)
 
-    if is_iv_crushing or is_price_exhausted or is_bear_exhausted:
-        is_bear_cover_case = is_bear_exhausted or (is_iv_crushing and spot < prev_close)
+    if is_bull_iv_crush or is_bear_iv_crush or is_price_exhausted or is_bear_exhausted:
+        is_bear_cover_case = is_bear_exhausted or is_bear_iv_crush
         if is_bear_cover_case:
             entry = round(spot, 2)
             tp = round(min(zero_gamma, max_pain), 2)
@@ -1869,38 +1890,83 @@ def analyze_nasdaq_top10_direction(scanned_map: Dict[str, WarRoomSnapshot]) -> D
         else (f"${qqq_snap.put_wall:.1f}" if qqq_snap else "N/A")
     )
 
-    if qqq_pos and pos_count >= 6:
-        overall_badge = "🟢 納指與權重全面正 Gamma（造市商逢低護盤、偏多震盪）"
-        inst_behavior = f"法人於 QQQ ({qqq_gex:+.0f}M) 與 {pos_count}/10 檔權重股皆採賣 Call 收租或偏多佈局。"
-        mm_mechanism = "指數與個股雙端皆為「跌買漲賣」減震護盤，回測 Put 支撐牆易有買盤承接。"
+    pos_str = ", ".join(pos_list) if pos_list else "無"
+    neg_str = ", ".join(neg_list) if neg_list else "無"
+
+    if qqq_pos and pos_count >= 6 and total_ndx_gex >= 0:
+        if pos_count == len(ndx_snaps):
+            overall_badge = f"🟢 納指與前十大權重 ({pos_count}/10) 全面正 Gamma（造市商逢低護盤、偏多震盪）"
+        else:
+            overall_badge = f"🟢 指數正 Gamma 領軍 + 權重多數正 Gamma（{pos_count}正 vs {neg_count}負，合計 {total_ndx_gex:+.1f}M｜偏多護盤為主）"
+        inst_behavior = (
+            f"法人於 QQQ ({qqq_gex:+.0f}M) 與 {pos_count}/10 檔權重股（{pos_str}）採賣 Put 護盤或 Covered Call 收租，"
+            f"前十大權重合計正曝險達 {total_ndx_gex:+.1f}M"
+            + (f"（僅 {neg_str} 共 {neg_count} 檔為負 Gamma）。" if neg_count > 0 else "。")
+        )
+        mm_mechanism = (
+            "指數與多數權重股處於「跌買漲賣」減震護盤，回測 Put 支撐牆易有造市商買盤承接"
+            + (f"；惟 {neg_str} 處於負 Gamma，個股波動將明顯大於指數。" if neg_count > 0 else "。")
+        )
         conclusion_plan = (
             f"1. 【指數結論】：QQQ 守穩翻轉點 {qqq_flip_str} 偏多操作，回測 Put 牆 {qqq_put_str} 低接。\n"
-            f"2. 【個股分組】：優先低接 🟢 正 Gamma 護盤組（{', '.join(pos_group) or '無'}）；避開 🔴 負 Gamma 組（{', '.join(neg_group) or '無'}）。"
+            f"2. 【🟢 正 Gamma 護盤組（優先低接）】：{', '.join(pos_group) or '無'}。\n"
+            f"3. 【🔴 負 Gamma 波動組（突破起漲點才追多、破牆停損）】：{', '.join(neg_group) or '無'}。"
         )
-    elif (not qqq_pos) and pos_count >= 5:
-        overall_badge = "🟡 指數負 Gamma 避險 vs. 權重正 Gamma 護盤（急殺易拉回之震盪盤）"
-        inst_behavior = f"法人集中在指數 ETF 買 Put 避險（SPY {spy_gex:+.0f}M / QQQ {qqq_gex:+.0f}M / SMH {smh_gex:+.0f}M），但 {pos_count}/10 檔權重股仍維持正 Gamma ({total_ndx_gex:+.0f}M)。"
-        mm_mechanism = "指數端造市商「順勢追空」易帶動急殺，但跌至個股 Put 牆時，正 Gamma 權重股造市商會「逆勢買進護盤」，形成急殺留長下影線的拉扯盤。"
-        conclusion_plan = (
-            f"1. 【指數結論】：QQQ 位於翻轉點 {qqq_flip_str} 下方（Put 牆 {qqq_put_str}），站回翻轉點前勿盲目摸底，突破起漲點再追多。\n"
-            f"2. 【🟢 正 Gamma 低接組】：{', '.join(pos_group) or '無'}（回測各自 Put 牆守穩可低接，近 Call 牆平倉）。\n"
-            f"3. 【🔴 負 Gamma 警戒組】：{', '.join(neg_group) or '無'}（造市商順勢助跌，跌破 Put 牆嚴禁接刀）。"
+    elif (not qqq_pos) and (pos_count >= 5 or total_ndx_gex > 0):
+        # 涵蓋「指數負 Gamma，但權重股 >=5 檔正 Gamma」或「雖僅 3~4 檔正 Gamma 巨頭，但正 Gamma 金額極大使得權重合計 total_ndx_gex > 0」之強弱撕裂盤！
+        if pos_count >= 5:
+            overall_badge = (
+                f"🟡 指數負 Gamma 避險 vs. 權重多數正 Gamma 護盤（{pos_count}正 vs {neg_count}負，權重合計 {total_ndx_gex:+.1f}M｜急殺易見撐盤拉回）"
+            )
+        else:
+            overall_badge = (
+                f"🟠 指數與 {neg_count}/10 檔權重負 Gamma 壓制 vs. {pos_count} 檔巨頭正 Gamma 撐盤（權重合計 {total_ndx_gex:+.1f}M｜個股強弱撕裂分化盤）"
+            )
+        inst_behavior = (
+            f"法人於指數 ETF（SPY {spy_gex:+.0f}M / QQQ {qqq_gex:+.0f}M / SMH {smh_gex:+.0f}M）與 {neg_count}/10 檔權重股（{neg_str}）大買 Put 避險；"
+            f"但 {pos_count}/10 檔權重巨頭（{pos_str}）仍具大額正 Gamma 鎖倉，使前十大合計維持 {total_ndx_gex:+.1f}M 正曝險。"
         )
-    elif qqq_pos and pos_count < 6:
-        overall_badge = "🟠 指數正 Gamma 撐盤 vs. 權重負 Gamma 轉弱（拉指數出個股背離盤）"
-        inst_behavior = f"QQQ ({qqq_gex:+.0f}M) 雖維持正 Gamma，但已有 {neg_count}/10 檔權重股轉為負 Gamma ({total_ndx_gex:+.0f}M)。"
-        mm_mechanism = "指數表面抗跌，但多數權重股已失去造市商低接護盤，提防個股破牆拖累指數補跌。"
+        mm_mechanism = (
+            f"指數端與 {neg_count} 檔負 Gamma 權重股處於「跌賣漲買」助跌模式，跌破 Put 牆易引發連鎖拋售；"
+            f"但 {pos_count} 檔正 Gamma 權重股（{pos_str}）造市商採取「跌買漲賣」逆勢承接，形成『負 Gamma 族群領跌、正 Gamma 巨頭抗跌護盤』的分化盤勢。"
+        )
         conclusion_plan = (
-            f"1. 【指數結論】：嚴防 QQQ 跌破翻轉點 {qqq_flip_str} 轉空。\n"
-            f"2. 【個股分組】：避開 🔴 負 Gamma 轉弱組（{', '.join(neg_group) or '無'}）；僅短打 🟢 正 Gamma 組（{', '.join(pos_group) or '無'}）。"
+            f"1. 【指數結論】：QQQ ({qqq_gex:+.0f}M) 與費半 SMH ({smh_gex:+.0f}M) 為負 Gamma，未收復翻轉點 {qqq_flip_str} 前指數偏空警戒，跌破 {qqq_put_str} 順勢做空；但因 {pos_count} 檔巨頭合計仍具 {total_ndx_gex:+.1f}M 正 Gamma 支撐，急殺勿在正 Gamma 股支撐位追空。\n"
+            f"2. 【🔴 負 Gamma 破牆助跌組（優先避開或破牆順勢做空）】：{', '.join(neg_group) or '無'}（造市商追高殺低，跌破 Put 牆嚴禁接刀）。\n"
+            f"3. 【🟢 正 Gamma 護盤抗跌組（回測 Put 牆守穩可低接）】：{', '.join(pos_group) or '無'}（造市商逢低承接，下緣低接、上緣 Call 牆平倉）。"
+        )
+    elif qqq_pos and (pos_count < 6 or total_ndx_gex < 0):
+        overall_badge = (
+            f"🟠 指數正 Gamma 撐盤 vs. 權重 {neg_count}/10 檔負 Gamma 轉弱（{pos_count}正 vs {neg_count}負，合計 {total_ndx_gex:+.1f}M｜拉指數出個股背離盤）"
+        )
+        inst_behavior = (
+            f"QQQ ({qqq_gex:+.0f}M) 雖維持正 Gamma，但已有 {neg_count}/10 檔權重股（{neg_str}）轉為負 Gamma（前十大合計 {total_ndx_gex:+.1f}M），僅 {pos_str} 維持正 Gamma。"
+        )
+        mm_mechanism = "指數表面抗跌，但多數權重股已轉為「跌賣漲買」助跌結構，提防個股破牆拖累指數補跌。"
+        conclusion_plan = (
+            f"1. 【指數結論】：嚴防 QQQ 跌破翻轉點 {qqq_flip_str} 由正轉負補跌。\n"
+            f"2. 【🔴 負 Gamma 轉弱組（避開或破牆做空）】：{', '.join(neg_group) or '無'}。\n"
+            f"3. 【🟢 正 Gamma 抗跌組（僅限區間短打）】：{', '.join(pos_group) or '無'}。"
         )
     else:
-        overall_badge = "🔴 納指與權重全面負 Gamma 警戒（造市商追高殺低、嚴防破牆急殺）"
-        inst_behavior = f"法人於指數（QQQ {qqq_gex:+.0f}M / SPY {spy_gex:+.0f}M）與 {neg_count}/10 檔權重股同步大買 Put 避險。"
-        mm_mechanism = "指數與個股雙端皆處於「跌賣漲買」助跌模式，跌破 Put 牆將引發造市商連鎖拋售。"
+        if neg_count == len(ndx_snaps):
+            overall_badge = f"🔴 納指與前十大權重 ({neg_count}/10) 全面負 Gamma 警戒（造市商全面追高殺低、嚴防破牆急殺）"
+        else:
+            overall_badge = (
+                f"🔴 指數與多數權重負 Gamma 警戒（{pos_count}正 vs {neg_count}負，權重合計 {total_ndx_gex:+.1f}M｜造市商順勢助跌為主）"
+            )
+        inst_behavior = (
+            f"法人於指數（QQQ {qqq_gex:+.0f}M / SPY {spy_gex:+.0f}M / SMH {smh_gex:+.0f}M）與 {neg_count}/10 檔權重股（{neg_str}）同步大買 Put 避險，前十大合計淨曝險 {total_ndx_gex:+.1f}M"
+            + (f"（僅 {pos_str} 共 {pos_count} 檔維持正 Gamma）。" if pos_count > 0 else "。")
+        )
+        mm_mechanism = (
+            f"指數與 {neg_count} 檔主力權重股處於「跌賣漲買」助跌模式，跌破 Put 牆易引發造市商連鎖拋售"
+            + (f"；僅 {pos_str} 仍具正 Gamma 低接支撐。" if pos_count > 0 else "。")
+        )
         conclusion_plan = (
             f"1. 【指數結論】：QQQ 未收復翻轉點 {qqq_flip_str} 前偏空看待，跌破 {qqq_put_str} 順勢做空或停損。\n"
-            f"2. 【個股分組】：全面避開 🔴 負 Gamma 破牆組（{', '.join(neg_group) or '無'}）；僅關注 🟢 正 Gamma 組（{', '.join(pos_group) or '無'}）。"
+            f"2. 【🔴 負 Gamma 破牆組（避開接刀或順勢偏空）】：{', '.join(neg_group) or '無'}。\n"
+            f"3. 【🟢 少數正 Gamma 抗跌組（守穩 Put 牆才低接）】：{', '.join(pos_group) or '無'}。"
         )
 
     direction_summary = f"{inst_behavior} {mm_mechanism}"
@@ -2397,6 +2463,10 @@ def scan_single_ticker_worker(
         if exp_index == 0 and total_opt_vol <= 10.0:
             cached = load_verified_cache_entry(tk)
             if cached is not None:
+                try:
+                    export_snapshot_to_mt5_common_csv(cached[0])
+                except Exception:
+                    pass
                 return cached
 
         snap, df_gex = evaluate_snapshot_and_alerts(
@@ -2609,9 +2679,20 @@ class BackgroundPatrolDaemon:
                 only_mkt = bool(cfg.get("only_us_market_hours", True))
                 interval_sec = max(int(cfg.get("patrol_interval_min", 15)), 5) * 60
 
+                mt5_csv_file = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
+                if self.total_scans == 0 or not os.path.exists(mt5_csv_file):
+                    try:
+                        init_core_list = parse_watchlist_string(
+                            cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
+                        )
+                        scan_core_14_tickers_map(init_core_list, float(cfg.get("iv_drop_thresh", 6.0)))
+                    except Exception:
+                        pass
+
                 if enable_bg and tg_token and tg_chat_id:
-                    if enable_morning and is_premarket_briefing_window():
-                        if should_send_alert_with_cooldown("MARKET_BRIEFING", "MORNING_REPORT"):
+                    if enable_morning and (is_premarket_briefing_window() or is_morning_0600_rollover_window()):
+                        slot_tag = "ROLLOVER_0600_REPORT" if is_morning_0600_rollover_window() else "MORNING_REPORT"
+                        if should_send_alert_with_cooldown("MARKET_BRIEFING", slot_tag):
                             core_list = parse_watchlist_string(
                                 cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
                             )
@@ -3040,9 +3121,9 @@ def run_streamlit_warroom() -> None:
             for c_line in ndx_info["conclusion_plan"].split("\n"):
                 summary_md += f"  - {c_line}\n"
 
-            if ndx_info["pos_count"] >= 6 and (snap_map.get("QQQ") and snap_map["QQQ"].is_positive_gamma):
+            if ndx_info["pos_count"] >= 6 and (snap_map.get("QQQ") and snap_map["QQQ"].is_positive_gamma) and ndx_info["total_ndx_gex"] >= 0:
                 st.success(summary_md)
-            elif ndx_info["neg_count"] >= 6:
+            elif ndx_info["neg_count"] >= 6 and ndx_info["total_ndx_gex"] <= 0 and not (snap_map.get("QQQ") and snap_map["QQQ"].is_positive_gamma):
                 st.error(summary_md)
             else:
                 st.warning(summary_md)
