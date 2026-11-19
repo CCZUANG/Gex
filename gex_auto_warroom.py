@@ -475,7 +475,7 @@ def is_premarket_briefing_window() -> bool:
 def is_morning_0600_rollover_window() -> bool:
     """
     台灣時間週二至週六早上 06:00 ~ 06:25 (對應美股週一至週五收盤結算後、OANDA 換日時段)，
-    自動同步最新收盤 GEX 點位至 MT5 Common\Files\gex_mt5_levels.csv 並發送 06:00 換日早報。
+    自動同步最新收盤 GEX 點位至 MT5 Common\\Files\\gex_mt5_levels.csv 並發送 06:00 換日早報。
     """
     now_tw = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     if now_tw.weekday() not in {1, 2, 3, 4, 5}:
@@ -1204,13 +1204,20 @@ def evaluate_snapshot_and_alerts(
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
 
-    # 推估造市商當日總對沖金額佔現貨日成交金額之比例 (初始 Delta 對沖 + 盤中 Gamma 調倉)
+    # 推估造市商當日總對沖金額佔真實底層市場成交金額比例：
+    # 1. 初始 Delta 對沖：扣除價差單/轉倉對銷 (淨方向失衡約 35%) × 平均 Delta (0.35) ≈ 0.12
+    # 2. 盤中 Gamma 調倉：造市商採區間帶狀調倉 (實證係數約 0.55 × 單日預期振幅 %)
+    # 3. 納入期貨與現貨生態圈深度分母 (GLD 含黃金期現貨 4.5x、QQQ/SPY 含期指 3.5x、費半 2.0x)，避免 ETF 現貨量小導致失真爆表 100%！
     opt_total_vol = float(np.sum(call_vol) + np.sum(put_vol))
-    init_delta_hedge_usd = opt_total_vol * 100.0 * 0.35 * spot
+    init_delta_hedge_usd = opt_total_vol * 100.0 * 0.12 * spot
     daily_swing_pct = max(atm_iv_pct / 16.0, 0.5)
-    gamma_rehedge_usd = abs(net_gex_total) * 1e6 * daily_swing_pct * 1.8
-    spot_dollar_vol = max(vol_curr, vol_ma20 * 0.5, 1.0) * spot
-    mm_vol_share_pct = round(min(((init_delta_hedge_usd + gamma_rehedge_usd) / spot_dollar_vol) * 100.0, 99.9), 1)
+    gamma_rehedge_usd = abs(net_gex_total) * 1e6 * daily_swing_pct * 0.55
+    mm_total_hedge_usd = init_delta_hedge_usd + gamma_rehedge_usd
+
+    tk_u_mm = ticker.upper()
+    venue_depth_mult = 4.5 if tk_u_mm in {"GLD", "SLV"} else (3.5 if tk_u_mm in {"QQQ", "SPY", "IWM"} else (2.0 if tk_u_mm in {"SMH", "SOXX"} else 1.0))
+    effective_market_dollar_vol = max(vol_curr, vol_ma20 * 0.5, 1.0) * spot * venue_depth_mult
+    mm_vol_share_pct = round((mm_total_hedge_usd / max(effective_market_dollar_vol + mm_total_hedge_usd, 1.0)) * 100.0, 1)
     gex_rel_label = classify_gex_reliability(mm_vol_share_pct)
 
     snapshot = WarRoomSnapshot(
