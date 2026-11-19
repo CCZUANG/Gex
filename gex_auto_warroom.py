@@ -246,7 +246,7 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
     header = (
         "Ticker,SpotPrice,IsPosGamma,NetGEX_M,ZeroGamma,CallWall,PutWall,MaxPain,"
         "BullTrigger,BearTrigger,BullExhaust,BearExhaust,ATM_IV,IV_Peak,IV_DropPct,"
-        "DTE,ActiveAlertCode,UpdatedTW"
+        "DTE,ActiveAlertCode,UpdatedTW,MM_VolSharePct"
     )
     alert_code = snap.active_alerts[0].code if snap.active_alerts else "NONE"
     clean_tw = str(snap.timestamp_tw).replace(",", " ")
@@ -256,7 +256,7 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
         f"{snap.put_wall:.4f},{snap.max_pain:.4f},{snap.bull_squeeze_trigger:.4f},"
         f"{snap.bear_squeeze_trigger:.4f},{snap.bull_exhaustion_price:.4f},"
         f"{snap.bear_exhaustion_price:.4f},{snap.atm_iv_pct:.2f},{snap.iv_peak_pct:.2f},"
-        f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw}"
+        f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw},{float(getattr(snap, 'mm_vol_share_pct', 0.0)):.1f}"
     )
 
     target_dirs = {BASE_DIR, get_mt5_common_files_dir()}
@@ -782,6 +782,18 @@ class WarRoomSnapshot:
     bear_exhaustion_price: float
     charm_unwind_time_tw: str
     active_alerts: List[AlertSignal]
+    mm_vol_share_pct: float = 0.0
+    gex_reliability_label: str = "🟡一般"
+
+
+def classify_gex_reliability(mm_share_pct: float) -> str:
+    if mm_share_pct >= 20.0:
+        return "🔥極高"
+    if mm_share_pct >= 10.0:
+        return "🟢中高"
+    if mm_share_pct >= 5.0:
+        return "🟡一般"
+    return "⚪偏低(改看BB-MVP)" 
 
 
 def evaluate_snapshot_and_alerts(
@@ -1192,6 +1204,15 @@ def evaluate_snapshot_and_alerts(
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
 
+    # 推估造市商當日總對沖金額佔現貨日成交金額之比例 (初始 Delta 對沖 + 盤中 Gamma 調倉)
+    opt_total_vol = float(np.sum(call_vol) + np.sum(put_vol))
+    init_delta_hedge_usd = opt_total_vol * 100.0 * 0.35 * spot
+    daily_swing_pct = max(atm_iv_pct / 16.0, 0.5)
+    gamma_rehedge_usd = abs(net_gex_total) * 1e6 * daily_swing_pct * 1.8
+    spot_dollar_vol = max(vol_curr, vol_ma20 * 0.5, 1.0) * spot
+    mm_vol_share_pct = round(min(((init_delta_hedge_usd + gamma_rehedge_usd) / spot_dollar_vol) * 100.0, 99.9), 1)
+    gex_rel_label = classify_gex_reliability(mm_vol_share_pct)
+
     snapshot = WarRoomSnapshot(
         ticker=ticker.upper(),
         timestamp_tw=now_tw,
@@ -1221,6 +1242,8 @@ def evaluate_snapshot_and_alerts(
         bear_exhaustion_price=bear_exhaust,
         charm_unwind_time_tw=charm_tw_str,
         active_alerts=alerts,
+        mm_vol_share_pct=mm_vol_share_pct,
+        gex_reliability_label=gex_rel_label,
     )
     try:
         export_snapshot_to_mt5_common_csv(snapshot)
@@ -1468,6 +1491,7 @@ def format_streamlit_card_markdown(snap: WarRoomSnapshot) -> str:
         f"- **最新日 K**：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`)｜[Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
         f"- **期權體制**：{regime_emoji}",
         f"- **總淨曝險**：`{snap.net_gex_millions:+.2f}M`｜**Zero Gamma 翻轉點**：`${snap.zero_gamma_flip:.2f}`",
+        f"- **造市商控盤佔比 (GEX 有效度)**：`{float(getattr(snap, 'mm_vol_share_pct', 0.0)):.1f}%`（{getattr(snap, 'gex_reliability_label', classify_gex_reliability(float(getattr(snap, 'mm_vol_share_pct', 0.0))))}）",
         "",
         "##### 🏛️ 全場主力支撐壓力牆與破牆狀態",
         cw_line,
@@ -1521,6 +1545,7 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
         f"• 最新日K：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`) [Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
         f"• 期權體制：{regime_emoji}",
         f"• 總淨曝險：`{snap.net_gex_millions:+.2f}M`｜翻轉點：`${snap.zero_gamma_flip:.2f}`",
+        f"• 造市商佔比：`{float(getattr(snap, 'mm_vol_share_pct', 0.0)):.1f}%`（GEX有效度：{getattr(snap, 'gex_reliability_label', classify_gex_reliability(float(getattr(snap, 'mm_vol_share_pct', 0.0))))}）",
         "",
         "🏛️ *【全場主力支撐壓力牆與破牆狀態】*",
         (
@@ -1584,20 +1609,39 @@ def get_cfd_multiplier(etf_ticker: str, etf_spot: float) -> Tuple[str, float, fl
         try:
             import yfinance as yf
 
-            # 1. 先計算 16:00 ET 正規盤收盤之精確履約價換算比例 (Index_Close / ETF_Close)
+            # 1. 嚴格以「同一美股交易日 (YYYY-MM-DD)」之日K收盤價對齊計算換算倍率 (Index_Close / ETF_Close)，
+            #    徹底避免 GC=F 黃金期貨於台灣白天亞盤/歐盤 23 小時即時跳動時，拿「即時跳動期貨價 ÷ 昨晚凍結 GLD 收盤價」導致牆位全天漂移！
+            hist_etf = yf.Ticker(tk_u).history(period="5d", interval="1d")
             hist_idx = yf.Ticker(yf_sym).history(period="5d", interval="1d")
-            if not hist_idx.empty:
-                idx_close = float(hist_idx["Close"].iloc[-1])
-                if idx_close > 0:
-                    mult = idx_close / etf_spot
-                    latest_cfd = idx_close
+            if not hist_etf.empty and not hist_idx.empty:
+                etf_dates = [str(ts)[:10] for ts in hist_etf.index]
+                idx_date_map = {str(ts)[:10]: float(c) for ts, c in zip(hist_idx.index, hist_idx["Close"]) if float(c) > 0}
+                matched_mult = None
+                for d_str, e_c in zip(reversed(etf_dates), reversed(hist_etf["Close"].tolist())):
+                    e_val = float(e_c)
+                    if e_val > 0 and d_str in idx_date_map:
+                        matched_mult = idx_date_map[d_str] / e_val
+                        break
+                if matched_mult is not None and matched_mult > 0:
+                    mult = matched_mult
+                    latest_cfd = etf_spot * mult
+                else:
+                    idx_ref = float(hist_idx["Close"].iloc[-2]) if len(hist_idx) >= 2 else float(hist_idx["Close"].iloc[-1])
+                    if idx_ref > 0:
+                        mult = idx_ref / etf_spot
+                        latest_cfd = etf_spot * mult
 
-            # 2. 再抓含盤後 (16:00~17:00 ET / 夜盤 prepost=True) 之 ETF 最新成交價，反映 OANDA/MT5 盤後跳動
-            hist_post = yf.Ticker(tk_u).history(period="2d", interval="5m", prepost=True)
-            if not hist_post.empty:
-                etf_post_last = float(hist_post["Close"].iloc[-1])
-                if etf_post_last > 0:
-                    latest_cfd = etf_post_last * mult
+                # 2. 最新顯示現價 (latest_cfd) 可反映盤後/期貨最新跳動，但絕不回頭污染鎖定的牆位換算倍率 mult！
+                if tk_u == "GLD":
+                    live_gc = float(hist_idx["Close"].iloc[-1])
+                    if live_gc > 0:
+                        latest_cfd = live_gc
+                else:
+                    hist_post = yf.Ticker(tk_u).history(period="2d", interval="5m", prepost=True)
+                    if not hist_post.empty:
+                        etf_post_last = float(hist_post["Close"].iloc[-1])
+                        if etf_post_last > 0:
+                            latest_cfd = etf_post_last * mult
         except Exception:
             pass
         CFD_RATIO_CACHE[tk_u] = (now_ts, mult, latest_cfd)
@@ -2001,7 +2045,9 @@ def format_clean_3line_stock_brief(s: WarRoomSnapshot) -> str:
     pw_s = f"${s.put_wall:.0f}(破/次${s.next_lower_put_wall:.0f})" if s.put_wall > s.spot_price else f"${s.put_wall:.0f}"
     cw_s = f"${s.call_wall:.0f}(破/次${s.next_upper_call_wall:.0f})" if s.call_wall < s.spot_price else f"${s.call_wall:.0f}"
 
-    line1 = f"{light} *{s.ticker}* `${s.spot_price:.2f}` (`{chg_pct:+.1f}%`)｜`{s.net_gex_millions:+.0f}M`｜{short_v}"
+    mm_p = float(getattr(s, "mm_vol_share_pct", 0.0))
+    mm_tag = getattr(s, "gex_reliability_label", classify_gex_reliability(mm_p)).split("(")[0]
+    line1 = f"{light} *{s.ticker}* `${s.spot_price:.2f}` (`{chg_pct:+.1f}%`)｜`{s.net_gex_millions:+.0f}M`｜MM `{mm_p:.0f}%`({mm_tag})｜{short_v}"
     line2 = f"  Put `{pw_s}` / 痛 `${s.max_pain:.0f}` / Call `{cw_s}`｜翻 `${s.zero_gamma_flip:.1f}`｜🚀`${s.bull_squeeze_trigger:.0f}` 🩸`${s.bear_squeeze_trigger:.0f}`"
     return f"{line1}\n{line2}"
 
@@ -2022,7 +2068,7 @@ def generate_tv_sync_code_string(scanned_map: Dict[str, WarRoomSnapshot]) -> str
             pos_flag = 1 if sn.is_positive_gamma else 0
             segments.append(
                 f"{tv_sym}:{pos_flag},{lv['flip']:.1f},{lv['range_low']:.1f},{lv['range_high']:.1f},"
-                f"{lv['mp']:.1f},{lv['bull_start']:.1f},{lv['bull_tp']:.1f},{lv['bear_start']:.1f},{lv['bear_tp']:.1f}"
+                f"{lv['mp']:.1f},{lv['bull_start']:.1f},{lv['bull_tp']:.1f},{lv['bear_start']:.1f},{lv['bear_tp']:.1f},{float(getattr(sn, 'mm_vol_share_pct', 0.0)):.1f}"
             )
 
     # 2. 再輸出全部 18 檔 ETF 與個股原始點位
@@ -2031,7 +2077,7 @@ def generate_tv_sync_code_string(scanned_map: Dict[str, WarRoomSnapshot]) -> str
         pos_flag = 1 if sn.is_positive_gamma else 0
         segments.append(
             f"{tk_k.upper()}:{pos_flag},{lv['flip']:.2f},{lv['range_low']:.2f},{lv['range_high']:.2f},"
-            f"{lv['mp']:.2f},{lv['bull_start']:.2f},{lv['bull_tp']:.2f},{lv['bear_start']:.2f},{lv['bear_tp']:.2f}"
+            f"{lv['mp']:.2f},{lv['bull_start']:.2f},{lv['bull_tp']:.2f},{lv['bear_start']:.2f},{lv['bear_tp']:.2f},{float(getattr(sn, 'mm_vol_share_pct', 0.0)):.1f}"
         )
 
     return "|".join(segments)
@@ -2043,8 +2089,10 @@ def format_cfd_compact_morning_line(s: WarRoomSnapshot) -> str:
         return ""
     verdict, _, lv = classify_tactical_verdict(s, mult, latest_cfd)
     short_v = verdict.split("（")[0].strip()
+    mm_p = float(getattr(s, "mm_vol_share_pct", 0.0))
+    mm_tag = getattr(s, "gex_reliability_label", classify_gex_reliability(mm_p))
     return (
-        f"• *{cfd_name}* `{lv['spot']:.0f}`｜{short_v}\n"
+        f"• *{cfd_name}* `{lv['spot']:.0f}`｜MM `{mm_p:.1f}%`({mm_tag})｜{short_v}\n"
         f"  區間 `{lv['range_low']:.0f}~{lv['range_high']:.0f}`｜翻 `{lv['flip']:.0f}`｜🚀過`{lv['bull_start']:.0f}`➔`{lv['bull_tp']:.0f}`｜🩸破`{lv['bear_start']:.0f}`➔`{lv['bear_tp']:.0f}`"
     )
 
