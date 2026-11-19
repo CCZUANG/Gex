@@ -140,6 +140,40 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                         _t_wait.sleep(1.0)
                     except Exception:
                         pass
+        # 若先前已啟用無黑窗背景常駐 (--daemon-loop)，覆蓋新版程式重啟時必須同步自動重啟背景常駐，
+        # 否則舊版 --daemon-loop 仍會留在背景吐出舊版公式數值 (例如舊版 99.9% 佔比)！
+        if IS_WINDOWS_VPS:
+            try:
+                ps_check_daemon = (
+                    "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*gex_auto_warroom.py*--daemon-loop*' } "
+                    "| Select-Object -ExpandProperty ProcessId"
+                )
+                d_pids = subprocess.check_output(
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_check_daemon],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).decode("utf-8", errors="ignore").strip()
+                if d_pids:
+                    print("🔄 偵測到舊版無黑窗背景常駐 (--daemon-loop)，正在自動熱重啟為最新版程式碼...")
+                    for pid_s in d_pids.splitlines():
+                        pid_s = pid_s.strip()
+                        if pid_s.isdigit():
+                            subprocess.call(["taskkill", "/F", "/PID", pid_s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    pyw_exe = sys.executable.replace("python.exe", "pythonw.exe")
+                    if not os.path.exists(pyw_exe):
+                        pyw_exe = sys.executable
+                    DETACHED_PROCESS = 0x00000008
+                    CREATE_NO_WINDOW = 0x08000000
+                    subprocess.Popen(
+                        [pyw_exe, os.path.abspath(__file__), "--daemon-loop"],
+                        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=True,
+                    )
+            except Exception:
+                pass
+
         chosen_port = 8501
         print("🚀 正在啟動 Windows VPS 全美股 GEX 戰情室與 24H 後台推播守護程序...")
         print("   • 本機設定網址: http://localhost:8501 (不需開放 VPS 防火牆)")
