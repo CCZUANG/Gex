@@ -140,9 +140,11 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                         _t_wait.sleep(1.0)
                     except Exception:
                         pass
-        # 若先前已啟用無黑窗背景常駐 (--daemon-loop)，覆蓋新版程式重啟時必須同步自動重啟背景常駐，
-        # 否則舊版 --daemon-loop 仍會留在背景吐出舊版公式數值 (例如舊版 99.9% 佔比)！
+        chosen_port = 8501
+        script_path = os.path.abspath(__file__)
         if IS_WINDOWS_VPS:
+            import time as _t_boot
+            # 1. 強制清除所有舊版背景常駐 (--daemon-loop)，確保 100% 切換為最新版程式碼
             try:
                 ps_check_daemon = (
                     "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*gex_auto_warroom.py*--daemon-loop*' } "
@@ -154,30 +156,76 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                     timeout=5,
                 ).decode("utf-8", errors="ignore").strip()
                 if d_pids:
-                    print("🔄 偵測到舊版無黑窗背景常駐 (--daemon-loop)，正在自動熱重啟為最新版程式碼...")
+                    print("🔄 正在終止舊版背景常駐 (--daemon-loop)...")
                     for pid_s in d_pids.splitlines():
                         pid_s = pid_s.strip()
                         if pid_s.isdigit():
                             subprocess.call(["taskkill", "/F", "/PID", pid_s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    pyw_exe = sys.executable.replace("python.exe", "pythonw.exe")
-                    if not os.path.exists(pyw_exe):
-                        pyw_exe = sys.executable
-                    DETACHED_PROCESS = 0x00000008
-                    CREATE_NO_WINDOW = 0x08000000
-                    subprocess.Popen(
-                        [pyw_exe, os.path.abspath(__file__), "--daemon-loop"],
-                        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        close_fds=True,
-                    )
+                    _t_boot.sleep(1.0)
             except Exception:
                 pass
 
-        chosen_port = 8501
-        print("🚀 正在啟動 Windows VPS 全美股 GEX 戰情室與 24H 後台推播守護程序...")
-        print("   • 本機設定網址: http://localhost:8501 (不需開放 VPS 防火牆)")
-        script_path = os.path.abspath(__file__)
+            pyw_exe = re.sub(r"python\.exe$", "pythonw.exe", sys.executable, flags=re.IGNORECASE)
+            if not os.path.exists(pyw_exe):
+                pyw_exe = sys.executable
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
+            bg_flags = DETACHED_PROCESS | CREATE_NO_WINDOW
+
+            # 2. 無黑窗背景啟動最新版 24H Telegram/MT5 守護常駐 (--daemon-loop)
+            subprocess.Popen(
+                [pyw_exe, script_path, "--daemon-loop"],
+                creationflags=bg_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+
+            # 3. 無黑窗背景啟動最新版 Streamlit 網頁戰情室：
+            #    使用 sys.executable + CREATE_NO_WINDOW 並導向 gex_streamlit.log，避免 pythonw.exe 無 stdout 導致 Streamlit 閃退！
+            st_log_path = os.path.join(BASE_DIR, "gex_streamlit.log")
+            st_log_f = open(st_log_path, "w", encoding="utf-8", errors="ignore")
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "streamlit",
+                    "run",
+                    script_path,
+                    "--server.address",
+                    "127.0.0.1",
+                    "--server.port",
+                    str(chosen_port),
+                    "--server.headless",
+                    "true",
+                ],
+                creationflags=CREATE_NO_WINDOW,
+                stdout=st_log_f,
+                stderr=st_log_f,
+                close_fds=False,
+            )
+            # 等待 Port 8501 實際就緒（最多 12 秒）後自動彈出瀏覽器網頁！
+            web_ready = False
+            for _ in range(24):
+                _t_boot.sleep(0.5)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_rdy:
+                    if s_rdy.connect_ex(("127.0.0.1", chosen_port)) == 0:
+                        web_ready = True
+                        break
+            if web_ready:
+                try:
+                    import webbrowser
+                    webbrowser.open(f"http://127.0.0.1:{chosen_port}")
+                except Exception:
+                    pass
+                print("✅ [無黑窗雙引擎背景啟動完成]（已自動彈出網頁並釋放 CMD，現在可直接關閉此視窗！）")
+                print(f"   • 網頁戰情室: http://127.0.0.1:{chosen_port}")
+                print("   • 24H 背景常駐: 已自動啟動最新版 Telegram 指令監聽與 MT5 同步引擎")
+            else:
+                print("⚠️ 網頁引擎 12 秒內尚未完成啟動，請稍候手動打開 http://127.0.0.1:8501 或檢查 gex_streamlit.log")
+            sys.exit(0)
+
+        print("🚀 正在啟動全美股 GEX 戰情室與 24H 後台推播守護程序...")
         sys.exit(
             subprocess.call(
                 [
@@ -495,7 +543,7 @@ def is_us_market_active_window() -> bool:
     if now_utc.weekday() >= 5:
         return False
     utc_hour_float = now_utc.hour + now_utc.minute / 60.0
-    return 14.45 <= utc_hour_float <= 21.2
+    return 14.60 <= utc_hour_float <= 21.15
 
 
 def is_premarket_briefing_window() -> bool:
@@ -2923,18 +2971,38 @@ class BackgroundPatrolDaemon:
                             tg_chat_id,
                             f"✅ *[VPS 後台守護執行中]*\n• 目前時間：`{now_tw}`\n• 累計掃描：`{self.total_scans}` 次\n• 累計推播：`{self.total_pushed}` 則\n• 狀態：`{self.last_run_tw}`",
                         )
-                    elif cmd_clean in {"TV", "TV同步碼", "同步碼"}:
-                        core_list = parse_watchlist_string(
-                            cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
-                        )
-                        full_map = scan_core_14_tickers_map(core_list, float(cfg.get("iv_drop_thresh", 6.0)))
-                        s_map = {k: v[0] for k, v in full_map.items()}
-                        tv_str = generate_tv_sync_code_string(s_map)
+                    elif cmd_clean in {"TV", "TV碼", "TV同步碼", "同步碼", "TVSYNC"}:
                         send_telegram_alert(
                             tg_token,
                             tg_chat_id,
-                            f"📋 *【TradingView 一鍵畫線同步碼】*（點擊下方單行代碼即可複製，貼入 TV 指標設定即可自動畫出 US100、XAUUSD 與 18 檔關鍵線）：\n\n`{tv_str}`",
+                            "⏳ 已收到指令，正在即時計算 18 檔核心股與 US100/黃金最新 TV 同步碼（約需 10~20 秒），請稍候...",
+                            silent=True,
                         )
+                        try:
+                            core_list = parse_watchlist_string(
+                                cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
+                            )
+                            full_map = scan_core_14_tickers_map(core_list, float(cfg.get("iv_drop_thresh", 6.0)))
+                            s_map = {k: v[0] for k, v in full_map.items()}
+                            tv_str = generate_tv_sync_code_string(s_map)
+                            if tv_str:
+                                send_telegram_alert(
+                                    tg_token,
+                                    tg_chat_id,
+                                    f"📋 *【TradingView 一鍵畫線同步碼】*（點擊下方單行代碼即可複製，貼入 TV 指標設定即可自動畫出 US100、XAUUSD 與 18 檔關鍵線）：\n\n`{tv_str}`",
+                                )
+                            else:
+                                send_telegram_alert(
+                                    tg_token,
+                                    tg_chat_id,
+                                    "⚠️ 本次無法從 Yahoo Finance 取得有效報價，TV 同步碼為空，請稍後再試一次。",
+                                )
+                        except Exception as tv_exc:
+                            send_telegram_alert(
+                                tg_token,
+                                tg_chat_id,
+                                f"⚠️ 產出 TV 同步碼時發生錯誤：`{tv_exc}`",
+                            )
                     elif cmd_clean in {"MORNING", "BRIEF", "早報"}:
                         core_list = parse_watchlist_string(
                             cfg.get("core_watchlist", ", ".join(DEFAULT_CORE_WATCHLIST))
