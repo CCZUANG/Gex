@@ -332,14 +332,35 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
     )
     alert_code = snap.active_alerts[0].code if snap.active_alerts else "NONE"
     clean_tw = str(snap.timestamp_tw).replace(",", " ")
-    row_str = (
+    mm_share = float(getattr(snap, "mm_vol_share_pct", 0.0))
+    rows_to_upsert = {}
+    rows_to_upsert[snap.ticker.upper()] = (
         f"{snap.ticker.upper()},{snap.spot_price:.4f},{1 if snap.is_positive_gamma else 0},"
         f"{snap.net_gex_millions:.2f},{snap.zero_gamma_flip:.4f},{snap.call_wall:.4f},"
         f"{snap.put_wall:.4f},{snap.max_pain:.4f},{snap.bull_squeeze_trigger:.4f},"
         f"{snap.bear_squeeze_trigger:.4f},{snap.bull_exhaustion_price:.4f},"
         f"{snap.bear_exhaustion_price:.4f},{snap.atm_iv_pct:.2f},{snap.iv_peak_pct:.2f},"
-        f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw},{float(getattr(snap, 'mm_vol_share_pct', 0.0)):.1f}"
+        f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw},{mm_share:.1f}"
     )
+
+    # 同步寫入已換算好的 US100 / XAUUSD / US500 最終點位（與 TV 同步碼 / Telegram 100% 一致，MT5 直接讀取免再乘倍率）
+    cfd_sym_map = {"QQQ": "US100", "GLD": "XAUUSD", "SPY": "US500"}
+    tk_up = snap.ticker.upper()
+    if tk_up in cfd_sym_map:
+        try:
+            cfd_sym = cfd_sym_map[tk_up]
+            _, mult, latest_cfd = get_cfd_multiplier(tk_up, snap.spot_price)
+            _, _, lv = classify_tactical_verdict(snap, mult, latest_cfd)
+            rows_to_upsert[cfd_sym] = (
+                f"{cfd_sym},{lv['spot']:.4f},{1 if snap.is_positive_gamma else 0},"
+                f"{snap.net_gex_millions:.2f},{lv['flip']:.4f},{lv['range_high']:.4f},"
+                f"{lv['range_low']:.4f},{lv['mp']:.4f},{lv['bull_start']:.4f},"
+                f"{lv['bear_start']:.4f},{lv['bull_tp']:.4f},"
+                f"{lv['bear_tp']:.4f},{snap.atm_iv_pct:.2f},{snap.iv_peak_pct:.2f},"
+                f"{snap.iv_drop_from_peak_pct:.2f},{snap.dte_days:.1f},{alert_code},{clean_tw},{mm_share:.1f}"
+            )
+        except Exception:
+            pass
 
     target_dirs = {BASE_DIR, get_mt5_common_files_dir()}
     primary_csv = os.path.join(get_mt5_common_files_dir(), "gex_mt5_levels.csv")
@@ -360,7 +381,7 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
                                 existing_rows[tk_key] = s
                 except Exception:
                     pass
-            existing_rows[snap.ticker.upper()] = row_str
+            existing_rows.update(rows_to_upsert)
             try:
                 with open(csv_path, "w", encoding="utf-8") as wf:
                     wf.write(header + "\n")
@@ -1064,6 +1085,18 @@ def evaluate_snapshot_and_alerts(
     except ValueError:
         charm_tw_str = "到期日美東 14:00 / 台灣時間隔日 03:00:00 (UTC+8)"
 
+    opt_total_vol = float(np.sum(call_vol) + np.sum(put_vol))
+    init_delta_hedge_usd = opt_total_vol * 100.0 * 0.12 * spot
+    daily_swing_pct = max(atm_iv_pct / 16.0, 0.5)
+    gamma_rehedge_usd = abs(net_gex_total) * 1e6 * daily_swing_pct * 0.55
+    mm_total_hedge_usd = init_delta_hedge_usd + gamma_rehedge_usd
+
+    tk_u_mm = ticker.upper()
+    venue_depth_mult = 4.5 if tk_u_mm in {"GLD", "SLV"} else (3.5 if tk_u_mm in {"QQQ", "SPY", "IWM"} else (2.0 if tk_u_mm in {"SMH", "SOXX"} else 1.0))
+    effective_market_dollar_vol = max(vol_curr, vol_ma20 * 0.5, 1.0) * spot * venue_depth_mult
+    mm_vol_share_pct = round((mm_total_hedge_usd / max(effective_market_dollar_vol + mm_total_hedge_usd, 1.0)) * 100.0, 1)
+    gex_rel_label = classify_gex_reliability(mm_vol_share_pct)
+
     alerts: List[AlertSignal] = []
 
     if (
@@ -1277,6 +1310,36 @@ def evaluate_snapshot_and_alerts(
                 )
             )
 
+    # 倒置型買 Call 逼空負 Gamma 獨立主動警報 (MM 佔比 >= 10% 過濾雜訊，且尚未發送突破起漲點警報時主動通知)
+    if (
+        (not is_pos_gamma)
+        and (zero_gamma < spot * 0.995)
+        and (mm_vol_share_pct >= 10.0)
+        and (spot >= prev_close * 0.99)
+        and not (is_bull_iv_crush or is_price_exhausted)
+        and not any(a.code in {"BULL_SQUEEZE_START", "BREAK_CALL_WALL"} for a in alerts)
+    ):
+        entry = round(spot, 2)
+        tp = round(max(bull_exhaust, spot * 1.05), 2)
+        reward = max(tp - entry, spot * 0.03)
+        sl = round(entry - reward / 2.2, 2)
+        alerts.append(
+            AlertSignal(
+                code="INVERTED_CALL_SQUEEZE_SETUP",
+                title=f"🔥 【{ticker} 倒置買 Call 逼空負 Gamma 蓄勢警報】",
+                chart_badge=f"[倒置買Call逼空] 翻轉點 ${zero_gamma:.2f} 在現價下方",
+                description=(
+                    f"偵測到市場搶買高 IV Call 使 {ticker} 形成倒置負 Gamma 結構（翻轉點 ${zero_gamma:.2f} 位於現價 ${spot:.2f} 下方，"
+                    f"造市商佔比 {mm_vol_share_pct:.1f}%），造市商被迫順勢買進避險，非破牆走空。"
+                ),
+                action_plan=f"守穩翻轉點 ${zero_gamma:.2f} 偏多卡位，帶量衝破起漲點 ${bull_trigger:.2f} 將加速軋空。",
+                entry_price=entry,
+                sl_price=sl,
+                tp_price=tp,
+                rrr=2.2,
+            )
+        )
+
     tk_state["iv_peak_pct"] = round(iv_peak_pct, 2)
     tk_state["last_spot"] = round(spot, 2)
     tracker[ticker.upper()] = tk_state
@@ -1286,21 +1349,7 @@ def evaluate_snapshot_and_alerts(
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
 
-    # 推估造市商當日總對沖金額佔真實底層市場成交金額比例：
-    # 1. 初始 Delta 對沖：扣除價差單/轉倉對銷 (淨方向失衡約 35%) × 平均 Delta (0.35) ≈ 0.12
-    # 2. 盤中 Gamma 調倉：造市商採區間帶狀調倉 (實證係數約 0.55 × 單日預期振幅 %)
-    # 3. 納入期貨與現貨生態圈深度分母 (GLD 含黃金期現貨 4.5x、QQQ/SPY 含期指 3.5x、費半 2.0x)，避免 ETF 現貨量小導致失真爆表 100%！
-    opt_total_vol = float(np.sum(call_vol) + np.sum(put_vol))
-    init_delta_hedge_usd = opt_total_vol * 100.0 * 0.12 * spot
-    daily_swing_pct = max(atm_iv_pct / 16.0, 0.5)
-    gamma_rehedge_usd = abs(net_gex_total) * 1e6 * daily_swing_pct * 0.55
-    mm_total_hedge_usd = init_delta_hedge_usd + gamma_rehedge_usd
 
-    tk_u_mm = ticker.upper()
-    venue_depth_mult = 4.5 if tk_u_mm in {"GLD", "SLV"} else (3.5 if tk_u_mm in {"QQQ", "SPY", "IWM"} else (2.0 if tk_u_mm in {"SMH", "SOXX"} else 1.0))
-    effective_market_dollar_vol = max(vol_curr, vol_ma20 * 0.5, 1.0) * spot * venue_depth_mult
-    mm_vol_share_pct = round((mm_total_hedge_usd / max(effective_market_dollar_vol + mm_total_hedge_usd, 1.0)) * 100.0, 1)
-    gex_rel_label = classify_gex_reliability(mm_vol_share_pct)
 
     snapshot = WarRoomSnapshot(
         ticker=ticker.upper(),
@@ -1623,8 +1672,10 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
     anomalies = detect_special_gex_anomalies(snap, mult)
     fmt = ".0f" if mult > 5.0 else ".1f"
 
+    mm_p_tg = float(getattr(snap, "mm_vol_share_pct", 0.0))
+    mm_lbl_tg = getattr(snap, "gex_reliability_label", classify_gex_reliability(mm_p_tg))
     lines = [
-        f"*{snap.ticker} 建議：{verdict}*",
+        f"*{snap.ticker} 建議：{verdict}*｜🏛️ MM佔比 `{mm_p_tg:.1f}%` ({mm_lbl_tg})",
         f"💡 *建議操作*：{reason}",
         f"🎯 *關鍵路線*：盤整 `${lv['range_low']:{fmt}}~${lv['range_high']:{fmt}}`｜🚀 漲過 `${lv['bull_start']:{fmt}}` 做多 ➔ `${lv['bull_tp']:{fmt}}` 平倉｜🩸 跌破 `${lv['bear_start']:{fmt}}` 加空 ➔ `${lv['bear_tp']:{fmt}}` 回補",
         "",
@@ -1634,7 +1685,7 @@ def format_telegram_card_message(snap: WarRoomSnapshot) -> str:
         f"• 最新日K：`${snap.spot_price:.2f}` (`{chg_pct:+.2f}%` / 昨收 `${snap.prev_close:.2f}`) [Yahoo Finance](https://finance.yahoo.com/quote/{snap.ticker})",
         f"• 期權體制：{regime_emoji}",
         f"• 總淨曝險：`{snap.net_gex_millions:+.2f}M`｜翻轉點：`${snap.zero_gamma_flip:.2f}`",
-        f"• 造市商佔比：`{float(getattr(snap, 'mm_vol_share_pct', 0.0)):.1f}%`（GEX有效度：{getattr(snap, 'gex_reliability_label', classify_gex_reliability(float(getattr(snap, 'mm_vol_share_pct', 0.0))))}）",
+        f"• 造市商佔比：`{mm_p_tg:.1f}%`（GEX有效度：{mm_lbl_tg}）",
         "",
         "🏛️ *【全場主力支撐壓力牆與破牆狀態】*",
         (
@@ -2892,28 +2943,49 @@ class BackgroundPatrolDaemon:
                                         except Exception:
                                             pass
                             else:
-                                non_core_hits.append(snap)
+                                non_core_hits.append((snap, df_ohlcv, df_gex))
 
-                        # 非核心全美股：精選最強前 5 名彙整為「1 則精選黑馬榜單」，徹底杜絕一次 100 封洗版！
+                        # 非核心全美股：精選最強前 5 名彙整為榜單並逐檔補發 K 線+GEX 圖卡（僅榜單響鈴 1 聲、附圖靜音發送並即刻刪暫存檔）
                         if non_core_hits:
-                            non_core_hits.sort(key=lambda s: abs(s.net_gex_millions), reverse=True)
+                            non_core_hits.sort(key=lambda item: abs(item[0].net_gex_millions), reverse=True)
                             top5 = non_core_hits[:5]
                             digest_lines = [
-                                f"🐎 *【全美股異動精選 Top {len(top5)} 榜單】*（本次共偵測 {len(non_core_hits)} 檔觸發，已自動濃縮防洗版）",
-                                f"時間：`{self.last_run_tw}`（輸入代號即可單獨看 K 線圖）",
+                                f"🐎 *【全美股異動精選 Top {len(top5)} 榜單】*（本次共偵測 {len(non_core_hits)} 檔觸發，以下同步附上 K 線圖卡）",
+                                f"時間：`{self.last_run_tw}`",
                                 "",
                             ]
-                            for sn_h in top5:
+                            for sn_h, _, _ in top5:
                                 v_h, _, lv_h = classify_tactical_verdict(sn_h, 1.0)
                                 a0 = sn_h.active_alerts[0]
+                                mm_h = float(getattr(sn_h, "mm_vol_share_pct", 0.0))
+                                mm_lbl_h = getattr(sn_h, "gex_reliability_label", classify_gex_reliability(mm_h))
                                 digest_lines.extend([
-                                    f"*{sn_h.ticker}* (`${sn_h.spot_price:.2f}`)｜{v_h}",
+                                    f"*{sn_h.ticker}* (`${sn_h.spot_price:.2f}`)｜MM `{mm_h:.1f}%`({mm_lbl_h})｜{v_h}",
                                     f"  • 訊號：{a0.title}",
                                     f"  • 建議：進場 `${a0.entry_price:.2f}`｜停損 `${a0.sl_price:.2f}`｜目標 `${a0.tp_price:.2f}` (`RRR 1:{a0.rrr:.1f}`)",
                                     "",
                                 ])
                             if send_telegram_alert(tg_token, tg_chat_id, "\n".join(digest_lines), silent=False):
                                 self.total_pushed += 1
+
+                            for sn_h, df_ohlcv_h, df_gex_h in top5:
+                                out_png_h = os.path.join(BASE_DIR, f"_tmp_{sn_h.ticker}_darkhorse.png")
+                                try:
+                                    render_warroom_chart_png(sn_h, df_ohlcv_h, df_gex_h, out_png_h)
+                                    if send_telegram_alert(
+                                        tg_token,
+                                        tg_chat_id,
+                                        f"🐎 *[全美股黑馬附圖]* {format_telegram_card_message(sn_h)}",
+                                        out_png_h,
+                                        silent=True,
+                                    ):
+                                        self.total_pushed += 1
+                                finally:
+                                    if os.path.exists(out_png_h):
+                                        try:
+                                            os.remove(out_png_h)
+                                        except Exception:
+                                            pass
                     else:
                         self.last_run_tw = "非美股開盤時段自動待機中"
                 time.sleep(interval_sec)
