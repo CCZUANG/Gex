@@ -165,24 +165,24 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
             except Exception:
                 pass
 
-            pyw_exe = re.sub(r"python\.exe$", "pythonw.exe", sys.executable, flags=re.IGNORECASE)
-            if not os.path.exists(pyw_exe):
-                pyw_exe = sys.executable
-            DETACHED_PROCESS = 0x00000008
+            # 重要：Windows 上 DETACHED_PROCESS 與 CREATE_NO_WINDOW 互斥，且 pythonw.exe 配合 DEVNULL 在 Python 3.12+ 易靜默閃退！
+            # 改用 sys.executable + (CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) 並導向實體 log 檔，徹底脫離 CMD 且 100% 穩定常駐！
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
             CREATE_NO_WINDOW = 0x08000000
-            bg_flags = DETACHED_PROCESS | CREATE_NO_WINDOW
+            win_bg_flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
             # 2. 無黑窗背景啟動最新版 24H Telegram/MT5 守護常駐 (--daemon-loop)
-            subprocess.Popen(
-                [pyw_exe, script_path, "--daemon-loop"],
-                creationflags=bg_flags,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
+            dm_log_path = os.path.join(BASE_DIR, "gex_daemon.log")
+            dm_log_f = open(dm_log_path, "w", encoding="utf-8", errors="ignore")
+            p_daemon = subprocess.Popen(
+                [sys.executable, script_path, "--daemon-loop"],
+                creationflags=win_bg_flags,
+                stdout=dm_log_f,
+                stderr=dm_log_f,
+                close_fds=False,
             )
 
-            # 3. 無黑窗背景啟動最新版 Streamlit 網頁戰情室：
-            #    使用 sys.executable + CREATE_NO_WINDOW 並導向 gex_streamlit.log，避免 pythonw.exe 無 stdout 導致 Streamlit 閃退！
+            # 3. 無黑窗背景啟動最新版 Streamlit 網頁戰情室
             st_log_path = os.path.join(BASE_DIR, "gex_streamlit.log")
             st_log_f = open(st_log_path, "w", encoding="utf-8", errors="ignore")
             subprocess.Popen(
@@ -199,12 +199,12 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                     "--server.headless",
                     "true",
                 ],
-                creationflags=CREATE_NO_WINDOW,
+                creationflags=win_bg_flags,
                 stdout=st_log_f,
                 stderr=st_log_f,
                 close_fds=False,
             )
-            # 等待 Port 8501 實際就緒（最多 12 秒）後自動彈出瀏覽器網頁！
+            # 等待 Port 8501 實際就緒（最多 12 秒）並同步驗證 --daemon-loop 確實存活！
             web_ready = False
             for _ in range(24):
                 _t_boot.sleep(0.5)
@@ -212,17 +212,21 @@ if __name__ == "__main__" and not is_running_inside_streamlit():
                     if s_rdy.connect_ex(("127.0.0.1", chosen_port)) == 0:
                         web_ready = True
                         break
+            daemon_alive = (p_daemon.poll() is None)
             if web_ready:
                 try:
                     import webbrowser
                     webbrowser.open(f"http://127.0.0.1:{chosen_port}")
                 except Exception:
                     pass
-                print("✅ [無黑窗雙引擎背景啟動完成]（已自動彈出網頁並釋放 CMD，現在可直接關閉此視窗！）")
-                print(f"   • 網頁戰情室: http://127.0.0.1:{chosen_port}")
-                print("   • 24H 背景常駐: 已自動啟動最新版 Telegram 指令監聽與 MT5 同步引擎")
+            if daemon_alive:
+                print(f"✅ [24H 背景守護已確認存活 (PID={p_daemon.pid})]（關掉 CMD 與 Edge 網頁後 Telegram 照常 24H 回覆！）")
             else:
-                print("⚠️ 網頁引擎 12 秒內尚未完成啟動，請稍候手動打開 http://127.0.0.1:8501 或檢查 gex_streamlit.log")
+                print(f"⚠️ 背景守護程序啟動失敗 (Exit={p_daemon.returncode})，請檢查 {dm_log_path}")
+            if web_ready:
+                print(f"✅ [網頁戰情室已就緒]: http://127.0.0.1:{chosen_port}（現在可直接關閉此 CMD 視窗！）")
+            else:
+                print(f"⚠️ 網頁引擎 12 秒內尚未完成啟動，請稍候手動打開 http://127.0.0.1:{chosen_port} 或檢查 {st_log_path}")
             sys.exit(0)
 
         print("🚀 正在啟動全美股 GEX 戰情室與 24H 後台推播守護程序...")
@@ -382,13 +386,19 @@ def export_snapshot_to_mt5_common_csv(snap) -> str:
                 except Exception:
                     pass
             existing_rows.update(rows_to_upsert)
+            tmp_csv_path = csv_path + ".tmp"
             try:
-                with open(csv_path, "w", encoding="utf-8") as wf:
+                with open(tmp_csv_path, "w", encoding="utf-8") as wf:
                     wf.write(header + "\n")
                     for k in sorted(existing_rows.keys()):
                         wf.write(existing_rows[k] + "\n")
+                os.replace(tmp_csv_path, csv_path)
             except Exception:
-                pass
+                try:
+                    if os.path.exists(tmp_csv_path):
+                        os.remove(tmp_csv_path)
+                except Exception:
+                    pass
     return primary_csv
 
 
@@ -964,8 +974,9 @@ def evaluate_snapshot_and_alerts(
     # 正負 Gamma 完全由當下總淨曝險 (net_gex_total > 0) 決定，不人為扭曲
     is_pos_gamma = net_gex_total > 0
 
-    atm_idx = int(np.argmin(np.abs(strikes - spot)))
-    atm_iv_pct = float(((call_iv[atm_idx] + put_iv[atm_idx]) / 2.0) * 100.0)
+    near_order = np.argsort(np.abs(strikes - spot))[: min(3, len(strikes))]
+    near_ivs = ((call_iv[near_order] + put_iv[near_order]) / 2.0) * 100.0
+    atm_iv_pct = float(np.median(near_ivs))
 
     # 以美東交易日 (UTC-5) 作為當日 IV 峰值基準日，避免台灣時間凌晨 00:00~05:00 (前一日美股尾盤) 的高 IV 殘留到當晚！
     # 且當美股期權未開盤 (not is_us_market_active_window()) 時，期權根本沒有成交，強制鎖定 iv_drop_rel_pct = 0.0，絕不在休市期間誤報 IV 回落！
@@ -1248,7 +1259,7 @@ def evaluate_snapshot_and_alerts(
 
     # 僅在美股期權開盤時段、且處於負 Gamma (或大漲跌 >= 1.5%) 時，IV 回落 >= 6% 才視為 Squeeze 動能衰竭
     day_chg_abs_pct = abs((spot - prev_close) / max(prev_close, 0.01)) * 100.0
-    is_iv_crushing = (iv_drop_rel_pct >= iv_crush_drop_threshold_pct) and (
+    is_iv_crushing = (iv_crush_drop_threshold_pct <= iv_drop_rel_pct <= 35.0) and (
         (not is_pos_gamma) or day_chg_abs_pct >= 1.5
     )
     is_bull_iv_crush = is_iv_crushing and (spot >= prev_close) and (spot >= min(bull_trigger, call_wall) * 0.995)
@@ -1256,6 +1267,8 @@ def evaluate_snapshot_and_alerts(
     is_price_exhausted = (high_curr >= bull_exhaust * 0.995) and (upper_wick_ratio > 0.45) and (spot > bull_trigger)
     is_bear_exhausted = (not is_pos_gamma) and (low_curr <= bear_exhaust * 1.005) and (spot < prev_close)
 
+    if is_bull_iv_crush or is_price_exhausted:
+        alerts = [a for a in alerts if a.code not in {"BULL_SQUEEZE_START", "BREAK_CALL_WALL"}]
     if is_bull_iv_crush or is_bear_iv_crush or is_price_exhausted or is_bear_exhausted:
         is_bear_cover_case = is_bear_exhausted or is_bear_iv_crush
         if is_bear_cover_case:
@@ -1896,7 +1909,7 @@ def classify_tactical_verdict(
     bear_tp_exhaust = min(s.bear_exhaustion_price * mult, range_low * 0.985, bear_start * 0.98)
 
     day_chg_abs_pct = abs((s.spot_price - s.prev_close) / max(s.prev_close, 0.01)) * 100.0
-    iv_crushing = (s.iv_drop_from_peak_pct >= 6.0) and ((not s.is_positive_gamma) or day_chg_abs_pct >= 1.5)
+    iv_crushing = (6.0 <= s.iv_drop_from_peak_pct <= 35.0) and ((not s.is_positive_gamma) or day_chg_abs_pct >= 1.5)
     near_bull_exhaust = spot >= bull_tp_exhaust * 0.995
     near_bear_exhaust = spot <= bear_tp_exhaust * 1.005
 
@@ -1914,7 +1927,7 @@ def classify_tactical_verdict(
         "bear_tp": bear_tp_exhaust,
     }
 
-    if near_bull_exhaust or (iv_crushing and s.spot_price >= s.prev_close):
+    if near_bull_exhaust or (iv_crushing and s.spot_price >= s.prev_close and spot >= min(bull_start, cw) * 0.995):
         verdict = "⚠️ 【多單平倉 / 禁追多】（抵達上檔衰竭區或追價 IV 回落）"
         reason = (
             f"現價 (${spot:.1f}) 已觸及上檔多頭衰竭區 (${bull_tp_exhaust:.1f}) 或 IV 回落 {s.iv_drop_from_peak_pct:.1f}%；"
@@ -1922,7 +1935,7 @@ def classify_tactical_verdict(
         )
         return verdict, reason, levels
 
-    if near_bear_exhaust or (iv_crushing and s.spot_price < s.prev_close):
+    if near_bear_exhaust or (iv_crushing and s.spot_price < s.prev_close and spot <= max(bear_start, pw) * 1.005):
         verdict = "✅ 【空單平倉 / 禁追空】（抵達下檔衰竭區或恐慌 IV 降溫）"
         reason = (
             f"現價 (${spot:.1f}) 已觸及下檔空頭衰竭區 (${bear_tp_exhaust:.1f}) 或恐慌 IV 回落 {s.iv_drop_from_peak_pct:.1f}%；"
@@ -1968,6 +1981,12 @@ def classify_tactical_verdict(
             reason = (
                 f"現價 (${spot:.1f}) 已強勢突破原壓力 (${cw:.1f}) 轉為下方支撐；"
                 f"回測守穩 ${cw:.1f} 偏多操作，上檔漲至衰竭目標 ${bull_tp_exhaust:.1f} 建議分批平倉。"
+            )
+        elif spot < flip * 0.999:
+            verdict = "🟡 【正 Gamma 但現價低於翻轉點】（倒置護盤結構或期權休市落差，先觀望提防轉弱）"
+            reason = (
+                f"實際期權 Net GEX 仍為正 Gamma ({s.net_gex_millions:+.1f}M)，但現價 (${spot:.1f}) 低於翻轉點 (${flip:.1f})；"
+                f"屬底部賣 Put 倒置護盤結構或美股期權休市時差，暫不盲目逢低做多，待站回 ${flip:.1f} 或下緣 ${range_low:.1f} 守穩再評估（跌破 ${bear_start:.1f} 則轉空警戒）。"
             )
         elif abs(spot - range_low) / max(spot, 1.0) <= 0.012:
             verdict = "🟢 【逢低做多】（正 Gamma 回測 Put 支撐牆低接區）"
